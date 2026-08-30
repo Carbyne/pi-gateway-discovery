@@ -86,6 +86,16 @@ If a gateway exposes its OpenAI-compatible interface under a subpath (e.g.
 discovery probes `{base}/models` and `{base}/v1/models` and uses whichever
 answers as the inference base.
 
+> [!NOTE]
+> Gateway ids that match a pi built-in provider (`openai`, `anthropic`,
+> `mistral`, `gemini`, …) **override** that built-in provider for the whole
+> session. Use distinct ids (e.g. `yoda-openai`) when you want to keep the
+> built-in catalog alongside the gateway.
+>
+> `pi --list-models` shows the **cached** catalog (no network fetch). The
+> first interactive session (or `/gw sync`) performs the live discovery and
+> caches it in `models-store.json`.
+
 ## Configuration
 
 `~/.pi/agent/gateway-discovery.json` (created by `/gw add`):

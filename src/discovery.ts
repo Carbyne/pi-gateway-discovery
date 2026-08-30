@@ -406,7 +406,7 @@ function isNonChatModel(id: string): boolean {
     /(^|[/:._-])(embed|embedding|bge|gte|e5|rerank)([/:._-]|$)/u.test(normalized) ||
     normalized.includes("nomic-embed") ||
     /(^|[/:._-])(tts|whisper|transcribe|speech|audio)([/:._-]|$)/u.test(normalized) ||
-    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage)([/:._-]|$)/u.test(normalized) ||
+    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage|sora)([/:._-]|$)/u.test(normalized) ||
     // Gemini-specific generation/live families (veo=video, lyria=music)
     /(^|[/:._-])(veo|lyria|robotics|live)([/:._-]|$)/u.test(normalized)
   );
