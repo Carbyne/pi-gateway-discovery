@@ -1,0 +1,44 @@
+{
+  "name": "pi-gateway-discovery",
+  "version": "0.1.0",
+  "description": "Pi extension: dynamic model discovery for OpenAI-compatible and LiteLLM API gateways",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-agent",
+    "extension",
+    "model-discovery",
+    "litellm",
+    "openai-compatible"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT"
+}
