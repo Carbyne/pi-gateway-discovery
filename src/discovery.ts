@@ -580,10 +580,15 @@ function mapGatewayModel(
     maxTokens,
   };
 
-  // Inherit thinking levels and compat flags from the matched catalog entry.
+  // Inherit thinking levels and compat flags from the matched catalog entry,
+  // then apply the gateway's compat overrides (e.g. supportsStore:false for
+  // strict backends like the Mistral API).
   if (builtin) {
     if (builtin.thinkingLevelMap) model.thinkingLevelMap = builtin.thinkingLevelMap;
     if (builtin.compat) model.compat = builtin.compat;
+  }
+  if (gateway.compat && Object.keys(gateway.compat).length > 0) {
+    model.compat = { ...(model.compat ?? {}), ...gateway.compat };
   }
 
   return {

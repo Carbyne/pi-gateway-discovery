@@ -125,6 +125,7 @@ answers as the inference base.
 | `baseUrl` | Gateway base URL (no trailing slash). |
 | `api` | `openai-completions` (default), `openai-responses`, or `anthropic-messages`. A trailing `/v1` is stripped for anthropic. |
 | `apiKeyEnv` | Optional env var holding the API key (checked before the stored credential… actually the stored credential wins at request time; the env var is checked first in discovery). |
+| `compat` | Per-gateway compat overrides merged into every discovered model (e.g. `{ "supportsStore": false }` for gateways fronting the strict Mistral API, which rejects pi's `store` parameter). |
 | `excludedModels` | Model ids to never register. |
 
 ## Design notes

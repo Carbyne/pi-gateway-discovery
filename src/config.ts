@@ -24,6 +24,13 @@ export interface GatewayConfig {
   api?: GatewayApi;
   /** Optional ambient env var holding the API key (alternative to /login). */
   apiKeyEnv?: string;
+  /**
+   * Per-gateway compat overrides applied to every discovered model (merged
+   * over inherited catalog compat). Use for backend quirks, e.g.
+   * { "supportsStore": false } for gateways fronting the strict Mistral API,
+   * which rejects the `store` parameter pi sends to unknown endpoints.
+   */
+  compat?: Record<string, unknown>;
   /** Model ids to never register. */
   excludedModels?: string[];
 }
@@ -139,6 +146,9 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
       baseUrl: normalizeBaseUrl(item.baseUrl),
       ...(isGatewayApi(item.api) ? { api: item.api } : {}),
       ...(typeof item.apiKeyEnv === "string" && item.apiKeyEnv.trim() ? { apiKeyEnv: item.apiKeyEnv.trim() } : {}),
+      ...(item.compat && typeof item.compat === "object" && !Array.isArray(item.compat)
+        ? { compat: item.compat as Record<string, unknown> }
+        : {}),
       ...(excludedModels && excludedModels.length > 0 ? { excludedModels } : {}),
     };
   });
