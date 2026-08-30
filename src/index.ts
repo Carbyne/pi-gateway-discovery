@@ -80,6 +80,7 @@ interface SyncInfo {
   healthyEndpoints?: number;
   unhealthyEndpoints?: number;
   litellmEnriched?: boolean;
+  maxTokensCappedCount?: number;
   error?: string;
 }
 
@@ -201,6 +202,9 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
           healthyEndpoints: result.status.healthyEndpoints,
           unhealthyEndpoints: result.status.unhealthyEndpoints,
           litellmEnriched: result.status.litellmEnriched,
+          ...(result.status.maxTokensCapped
+            ? { maxTokensCappedCount: result.status.maxTokensCapped.length }
+            : {}),
         });
         return result.models;
       } catch (error) {
@@ -379,6 +383,7 @@ function summarizeSync(id: string): Record<string, unknown> {
     matched: info.matchedCount,
     unmatched: info.unmatchedCount ?? info.unmatched?.length ?? 0,
     litellmEnriched: info.litellmEnriched,
+    ...(info.maxTokensCappedCount ? { maxTokensCapped: info.maxTokensCappedCount } : {}),
     ...(info.healthyEndpoints !== undefined
       ? { healthyEndpoints: info.healthyEndpoints, unhealthyEndpoints: info.unhealthyEndpoints ?? 0 }
       : {}),
@@ -498,6 +503,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           ...(info.unmatchedCount !== undefined ? { unmatchedCount: info.unmatchedCount } : {}),
           ...(info.inferenceBaseUrl ? { inferenceBaseUrl: info.inferenceBaseUrl } : {}),
           ...(info.litellmEnriched !== undefined ? { litellmEnriched: info.litellmEnriched } : {}),
+          ...(info.maxTokensCappedCount !== undefined ? { maxTokensCappedCount: info.maxTokensCappedCount } : {}),
           ...(info.error ? { error: info.error } : {}),
         });
       });
@@ -767,7 +773,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       const sync = summarizeSync(gateway.id);
       const syncText =
         sync.state === "ok"
-          ? `${sync.models} models, ${sync.matched} matched, ${sync.unmatched} unmatched (${sync.at})`
+          ? `${sync.models} models, ${sync.matched} matched, ${sync.unmatched} unmatched${sync.maxTokensCapped ? `, ${sync.maxTokensCapped} output-capped` : ""} (${sync.at})`
           : sync.state === "error"
             ? `error: ${sync.error}`
             : `not synced — ${sync.hint}`;

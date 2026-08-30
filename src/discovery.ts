@@ -66,6 +66,8 @@ export interface GatewayDiscoveryStatus {
   unhealthyEndpoints?: number;
   /** True when LiteLLM /model/info metadata was merged in. */
   litellmEnriched: boolean;
+  /** Models whose advertised output ceiling was capped to ¼ of the window. */
+  maxTokensCapped?: Array<{ id: string; reported: number; capped: number }>;
 }
 
 export interface GatewayDiscoveryResult {
@@ -471,6 +473,8 @@ function isNonChatModel(id: string): boolean {
 interface MappedModel {
   model: Model<Api>;
   source: string; // "builtin:provider/id" | "gateway"
+  /** Set when the advertised output ceiling was capped (see FULL_WINDOW cap). */
+  maxTokensCapped?: { reported: number };
 }
 
 function mapGatewayModel(
@@ -532,6 +536,20 @@ function mapGatewayModel(
     builtin?.maxTokens ??
     DEFAULT_MAX_TOKENS;
   maxTokens = Math.min(maxTokens, contextWindow);
+
+  // Full-window output (a vLLM convention: max_output = max_model_len) is
+  // fragile in pi: on from-scratch turns (first turn, post-compaction) pi
+  // estimates prompt tokens as chars/4, and tool/JSON-heavy prompts tokenize
+  // well below 4 chars/token — the underestimate can exceed pi's 4096-token
+  // safety margin, so the backend rejects input + max_output > window. Cap
+  // the advertised output at a quarter of the window: still a huge budget,
+  // and it keeps from-scratch prompts under ~75% of the window safe.
+  let maxTokensCapped: { reported: number } | undefined;
+  if (maxTokens > contextWindow / 4) {
+    const cap = Math.max(2048, Math.floor(contextWindow / 4));
+    maxTokensCapped = { reported: maxTokens };
+    maxTokens = cap;
+  }
 
   // Cost: OpenRouter-style `pricing` (per million, as strings) → LiteLLM
   // `*_cost_per_token` (per token) → built-in catalog → zero.
@@ -614,6 +632,7 @@ function mapGatewayModel(
   return {
     model,
     source: builtin ? `builtin:${builtin.provider}/${builtin.id}` : "gateway",
+    ...(maxTokensCapped ? { maxTokensCapped } : {}),
   };
 }
 
@@ -647,6 +666,7 @@ export async function discoverGateway(
   const models: Model<Api>[] = [];
   const matched: ModelMatch[] = [];
   const unmatched: GatewayDiscoveryStatus["unmatched"] = [];
+  const maxTokensCapped: NonNullable<GatewayDiscoveryStatus["maxTokensCapped"]> = [];
   const seen = new Set<string>();
 
   for (const entry of entries) {
@@ -661,6 +681,9 @@ export async function discoverGateway(
     if (!mapped) continue;
 
     models.push(mapped.model);
+    if (mapped.maxTokensCapped) {
+      maxTokensCapped.push({ id, reported: mapped.maxTokensCapped.reported, capped: mapped.model.maxTokens });
+    }
     if (mapped.source === "gateway") {
       unmatched.push({ id, candidates: suggestBuiltinCandidates(id) });
     } else {
@@ -677,6 +700,7 @@ export async function discoverGateway(
       inferenceBaseUrl,
       ...(healthCounts ? { healthyEndpoints: healthCounts.healthy, unhealthyEndpoints: healthCounts.unhealthy } : {}),
       litellmEnriched: (infoMap?.size ?? 0) > 0,
+      ...(maxTokensCapped.length > 0 ? { maxTokensCapped } : {}),
     },
   };
 }

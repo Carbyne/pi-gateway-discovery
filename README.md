@@ -135,13 +135,27 @@ answers as the inference base.
 | `modelOverrides` | Per-model overrides keyed by model id (topmost layer): `api` (route to a different protocol, e.g. `openai-responses`), `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` (null marks a level unsupported), `compat`. Manageable via the `gateways` tool (`action: "override"`) or `/gw override <id> <model> [k=v ...]`. |
 | `excludedModels` | Model ids to never register. |
 
+## Output-token capping
+
+Gateways (vLLM in particular) often advertise `max_output_tokens` equal to
+the full context window. That is fragile in pi: on from-scratch turns (first
+turn, post-compaction) pi estimates prompt tokens as chars/4, and
+tool/JSON-heavy prompts tokenize well below 4 chars/token. The underestimate
+can exceed pi's internal 4096-token safety margin, so the backend rejects
+the request with `input + max_output > context window` — even though the
+prompt fits fine. For such models this extension caps the advertised output
+at ¼ of the context window (min 2048): still a huge budget, and it keeps
+any from-scratch prompt under ~75% of the window safe. Affected models are
+reported in `/gw list` ("N output-capped") and in the `gateways` tool sync
+status. Override per model with `modelOverrides.<id>.maxTokens` if you want
+a different ceiling.
+
 ## Automatic updates
 
 pi itself refreshes model catalogs in the background for interactive and RPC
 sessions, but `pi --list-models` and `pi -p` never touch the network. This
 extension closes that gap with a TTL-based auto-refresh
 (`autoRefreshTtlHours`, default 1h, `0` disables):
-
 - **On load (all modes)** — the extension factory (which pi awaits) checks
   the cached catalog age and re-discovers stale gateways *before* pi
   restores the cache, so `pi --list-models` and `pi -p` start with a fresh

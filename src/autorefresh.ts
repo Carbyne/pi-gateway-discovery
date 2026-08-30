@@ -139,6 +139,7 @@ export async function refreshStaleGateways(
       unmatchedCount?: number;
       inferenceBaseUrl?: string;
       litellmEnriched?: boolean;
+      maxTokensCappedCount?: number;
       error?: string;
     },
   ) => void,
@@ -169,6 +170,9 @@ export async function refreshStaleGateways(
           unmatchedCount: discovered.status.unmatched.length,
           inferenceBaseUrl: discovered.status.inferenceBaseUrl,
           litellmEnriched: discovered.status.litellmEnriched,
+          ...(discovered.status.maxTokensCapped
+            ? { maxTokensCappedCount: discovered.status.maxTokensCapped.length }
+            : {}),
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
