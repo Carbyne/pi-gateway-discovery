@@ -19,7 +19,7 @@
 
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { GatewayApi, GatewayConfig } from "./config.ts";
+import { inferenceBaseUrlForApi, type GatewayApi, type GatewayConfig } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -393,12 +393,18 @@ function lookupBuiltin(id: string): Model<Api> | undefined {
 // Model mapping
 // ---------------------------------------------------------------------------
 
-/** Embedding/reranker models are not chat models — never register them. */
-function isEmbeddingModel(id: string): boolean {
+/**
+ * Models that are not chat models — never register them. Covers
+ * embedding/reranker families plus obvious audio/speech, moderation, OCR,
+ * image-generation, and legacy non-chat completions families.
+ */
+function isNonChatModel(id: string): boolean {
   const normalized = id.toLowerCase();
   return (
     /(^|[/:._-])(embed|embedding|bge|gte|e5|rerank)([/:._-]|$)/u.test(normalized) ||
-    normalized.includes("nomic-embed")
+    normalized.includes("nomic-embed") ||
+    /(^|[/:._-])(tts|whisper|transcribe|speech|audio)([/:._-]|$)/u.test(normalized) ||
+    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage)([/:._-]|$)/u.test(normalized)
   );
 }
 
@@ -415,11 +421,12 @@ function mapGatewayModel(
   api: GatewayApi,
   inferenceBaseUrl: string,
 ): MappedModel | null {
-  if (isEmbeddingModel(id)) return null;
+  if (isNonChatModel(id)) return null;
   if (gateway.excludedModels?.includes(id)) return null;
 
   const builtin = lookupBuiltin(id);
   const architecture = asRecord(entry.architecture);
+  const capabilities = asRecord(entry.capabilities);
   const topProvider = asRecord(entry.top_provider);
   const supportedParams = Array.isArray(entry.supported_parameters)
     ? (entry.supported_parameters as unknown[]).filter((p): p is string => typeof p === "string")
@@ -434,12 +441,14 @@ function mapGatewayModel(
 
   const supportsVision =
     inputModalities?.includes("image") === true ||
+    capabilities?.vision === true ||
     info?.supports_vision === true ||
     infoInput?.includes("image") === true ||
     (builtin ? builtin.input.includes("image") : false);
 
   const supportsReasoning =
     entry.supports_reasoning === true ||
+    capabilities?.reasoning === true ||
     info?.supports_reasoning === true ||
     supportedParams.includes("reasoning") ||
     supportedParams.includes("include_reasoning") ||
@@ -448,6 +457,7 @@ function mapGatewayModel(
   const contextWindow =
     asNumber(entry.context_length) ??
     asNumber(entry.context_window) ??
+    asNumber(entry.max_context_length) ??
     asNumber(entry.max_input_tokens) ??
     asNumber(info?.max_input_tokens) ??
     builtin?.contextWindow ??
@@ -457,6 +467,7 @@ function mapGatewayModel(
     asNumber(topProvider?.max_completion_tokens) ??
     asNumber(entry.max_output_tokens) ??
     asNumber(entry.max_completion_tokens) ??
+    asNumber(entry.max_tokens) ??
     asNumber(info?.max_output_tokens) ??
     builtin?.maxTokens ??
     DEFAULT_MAX_TOKENS;
@@ -490,6 +501,7 @@ function mapGatewayModel(
 
   const name =
     asString(entry.name) ??
+    asString(entry.display_name) ??
     asString(info?.yaml_name) ??
     asString(entry.model_name && entry.model_name !== id ? entry.model_name : undefined) ??
     builtin?.name ??
@@ -535,7 +547,11 @@ export async function discoverGateway(
       ? { accept: "application/json", "anthropic-version": "2023-06-01", "x-api-key": apiKey }
       : { accept: "application/json", authorization: `Bearer ${apiKey}` };
 
-  const { entries, inferenceBaseUrl } = await fetchModelList(gateway.baseUrl, headers, signal);
+  const { entries, inferenceBaseUrl: rawInferenceBaseUrl } = await fetchModelList(gateway.baseUrl, headers, signal);
+  // The Anthropic SDK appends /v1/messages to the base URL, so a discovered
+  // base ending in /v1 would produce /v1/v1/messages — strip it for anthropic.
+  const inferenceBaseUrl =
+    api === "anthropic-messages" ? inferenceBaseUrlForApi(rawInferenceBaseUrl, api) : rawInferenceBaseUrl;
 
   // LiteLLM enrichment + health counts (parallel, best-effort).
   const [infoMap, healthCounts] = await Promise.all([
