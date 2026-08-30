@@ -20,7 +20,9 @@ For each configured gateway the extension:
    (then by id suffix) against pi's built-in model catalog, so well-known
    models served through a gateway keep their real name, context window,
    costs, and thinking-level map. Fuzzy candidates are *suggested* in status
-   output for human confirmation, never auto-applied.
+   output for human confirmation, never auto-applied. Google-style resource
+   prefixes (`models/gemini-2.5-flash`) are normalized to the bare model name,
+   which the OpenAI-compatible layer accepts in requests.
 4. **Registers with pi** via `createProvider` + `fetchModels`. Pi owns the
    model cache (`models-store.json`) and the refresh lifecycle; the catalog
    is restored from cache on startup even when the gateway is offline.

@@ -428,17 +428,28 @@ function lookupBuiltin(id: string): Model<Api> | undefined {
   const { byId, bySuffix } = getBuiltinIndex();
   const exact = byId.get(id);
   if (exact && exact.length > 0) return pickBest(exact);
+  // Suffix lookup for ALL ids — slash-less ones included (e.g. a bare
+  // "gemini-pro-latest" should still match "~google/gemini-pro-latest").
   const slash = id.lastIndexOf("/");
-  if (slash >= 0) {
-    const suffix = bySuffix.get(id.slice(slash + 1));
-    if (suffix && suffix.length > 0) return pickBest(suffix);
-  }
+  const suffix = slash >= 0 ? id.slice(slash + 1) : id;
+  const bySuffixMatch = bySuffix.get(suffix);
+  if (bySuffixMatch && bySuffixMatch.length > 0) return pickBest(bySuffixMatch);
   return undefined;
 }
 
 // ---------------------------------------------------------------------------
 // Model mapping
 // ---------------------------------------------------------------------------
+
+/**
+ * Google's OpenAI-compatible shim lists models with the native resource-name
+ * prefix (`models/gemini-2.5-flash`). The compatibility layer accepts the bare
+ * name in requests (verified against the yoda gemini lane), so strip the
+ * prefix for cleaner, catalog-matchable ids. Other prefixes are untouched.
+ */
+function normalizeModelId(id: string): string {
+  return id.startsWith("models/") ? id.slice("models/".length) : id;
+}
 
 /**
  * Models that are not chat models — never register them. Covers
@@ -614,8 +625,10 @@ export async function discoverGateway(
   const seen = new Set<string>();
 
   for (const entry of entries) {
-    const id = asString(entry.id);
-    if (!id || seen.has(id)) continue;
+    const rawId = asString(entry.id);
+    if (!rawId) continue;
+    const id = normalizeModelId(rawId);
+    if (seen.has(id)) continue;
     seen.add(id);
 
     const info = infoMap?.get(id);
