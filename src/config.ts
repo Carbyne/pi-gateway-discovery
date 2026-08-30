@@ -8,6 +8,7 @@
  */
 
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -67,6 +68,7 @@ export const AGENT_DIR = getAgentDir();
 export const CONFIG_PATH = join(AGENT_DIR, "gateway-discovery.json");
 export const AUTH_PATH = join(AGENT_DIR, "auth.json");
 export const MODELS_STORE_PATH = join(AGENT_DIR, "models-store.json");
+export const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 export function isGatewayApi(value: unknown): value is GatewayApi {
   return value === "openai-completions" || value === "openai-responses" || value === "anthropic-messages";
@@ -260,6 +262,22 @@ export async function saveConfig(next: GatewayConfigFile): Promise<void> {
     await rm(tempPath, { force: true });
     throw error;
   }
+}
+
+/** Read the user's default model from pi's settings (best-effort). */
+export function readSettingsDefault(): { provider: string; modelId: string } | undefined {
+  try {
+    const data = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
+      defaultProvider?: unknown;
+      defaultModel?: unknown;
+    };
+    if (typeof data.defaultProvider === "string" && typeof data.defaultModel === "string") {
+      return { provider: data.defaultProvider, modelId: data.defaultModel };
+    }
+  } catch {
+    // No settings file (or unreadable) — no default.
+  }
+  return undefined;
 }
 
 /** Remove one key from a JSON object file, preserving unrelated entries (used for auth.json / models-store.json cleanup). */

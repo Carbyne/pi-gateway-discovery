@@ -89,6 +89,20 @@ export function readStoreCheckedAt(providerId: string): number | undefined {
   }
 }
 
+/** Cached models for a provider, read fresh from pi's store (best-effort). */
+export function readStoreModels(providerId: string): unknown[] | undefined {
+  try {
+    const store = JSON.parse(readFileSync(MODELS_STORE_PATH, "utf8")) as Record<
+      string,
+      { models?: unknown[] }
+    >;
+    const models = store[providerId]?.models;
+    return Array.isArray(models) && models.length > 0 ? models : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Gateway ids whose cached catalog is missing or older than the TTL. */
 export function staleGatewayIds(config: GatewayConfigFile, ttlMs: number): string[] {
   if (ttlMs <= 0 || isOffline()) return [];

@@ -25,6 +25,7 @@ import {
   StringEnum,
   Type,
   type Api,
+  type Model,
   type Provider,
 } from "@earendil-works/pi-ai";
 import {
@@ -58,11 +59,13 @@ import {
   PERIODIC_CHECK_INTERVAL_MS,
   isOffline,
   markSelfWrite,
+  readStoreModels,
   refreshStaleGateways,
   staleGatewayIds,
   startStoreWatcher,
   ttlMsFromConfig,
 } from "./autorefresh.ts";
+import { readSettingsDefault } from "./config.ts";
 import { discoverGateway } from "./discovery.ts";
 
 // ---------------------------------------------------------------------------
@@ -468,6 +471,62 @@ function listGateways(ctx: Pick<ExtensionCommandContext, "modelRegistry">): Reco
   };
 }
 
+/**
+ * Restore a usable model when a session starts with the sentinel "unknown"
+ * model (see session_start). Best-effort: re-reads the store fresh, restores
+ * the gateway catalogs to the registry (offline), and sets the settings
+ * default model (or the first cached gateway model) as the session model.
+ */
+async function selfHealUnknownModel(
+  pi: ExtensionAPI,
+  ctx: Pick<ExtensionCommandContext, "modelRegistry" | "ui" | "hasUI">,
+): Promise<void> {
+  const gatewayIds = configFile.gateways.map((g) => g.id);
+  if (gatewayIds.length > 0) {
+    // Offline refresh re-reads the store (its file revision changed when the
+    // in-flight write completed) and republishes the cached catalogs.
+    void ctx.modelRegistry.refresh({ providers: gatewayIds, allowNetwork: false }).catch(() => {});
+  }
+
+  let restore: Model<Api> | undefined;
+  const def = readSettingsDefault();
+  if (def && configFile.gateways.some((g) => g.id === def.provider)) {
+    let models = readStoreModels(def.provider) as Model<Api>[] | undefined;
+    if (!models) {
+      // The racing write may still be in flight — give it a moment and retry.
+      await new Promise((r) => setTimeout(r, 500));
+      models = readStoreModels(def.provider) as Model<Api>[] | undefined;
+    }
+    restore = models?.find((m) => m.id === def.modelId);
+  }
+  if (!restore) {
+    for (const gateway of configFile.gateways) {
+      let models = readStoreModels(gateway.id) as Model<Api>[] | undefined;
+      if (!models) {
+        await new Promise((r) => setTimeout(r, 500));
+        models = readStoreModels(gateway.id) as Model<Api>[] | undefined;
+      }
+      if (models?.length) {
+        restore = models[0];
+        break;
+      }
+    }
+  }
+  if (!restore) return;
+
+  try {
+    const ok = await pi.setModel(restore);
+    if (ok && ctx.hasUI) {
+      ctx.ui.notify(
+        `Model was lost at session start (store read raced a write); restored ${restore.provider}/${restore.id}.`,
+        "info",
+      );
+    }
+  } catch {
+    // Best-effort; the user can still pick a model manually.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
@@ -519,7 +578,16 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   let stopStoreWatcher: (() => void) | undefined;
   let periodicTimer: NodeJS.Timeout | undefined;
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
+    // Self-heal: a session can start with the sentinel "unknown" model when
+    // its fresh ModelRuntime read the model store while a write was in
+    // flight (the store is written in-place; a concurrent reader can parse
+    // partial/empty JSON and silently restore no models). Re-read the store
+    // (the write has completed by now) and restore a usable model.
+    const current = ctx.model;
+    if (current && current.provider === "unknown" && current.id === "unknown") {
+      await selfHealUnknownModel(pi, ctx);
+    }
     if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
     stopStoreWatcher?.();
     stopStoreWatcher = startStoreWatcher({
