@@ -83,26 +83,71 @@ interface FetchOutcome {
   error?: string;
 }
 
-async function fetchJson(url: string, headers: Record<string, string>, signal?: AbortSignal): Promise<FetchOutcome> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT_MS);
-  const onAbort = () => controller.abort();
-  signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const res = await fetch(url, { headers, signal: controller.signal });
-    const text = await res.text();
-    let json: unknown;
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+const MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 400;
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const done = () => {
+      signal?.removeEventListener("abort", done);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * GET with JSON parsing, per-request timeout, and retries for transient
+ * network-level failures (connection reset/closed, timeout) and 502/503/504.
+ * Gateways behind a load balancer commonly drop connections during bursts of
+ * parallel requests (pi refreshes all providers concurrently), and Node's
+ * fetch does not retry those — without this, one unlucky provider in a
+ * parallel sync fails the whole discovery.
+ */
+async function fetchJson(
+  url: string,
+  headers: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<FetchOutcome> {
+  for (let attempt = 0; ; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT_MS);
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    let outcome: FetchOutcome;
     try {
-      json = text ? JSON.parse(text) : null;
-    } catch {
-      json = undefined;
+      const res = await fetch(url, { headers, signal: controller.signal });
+      const text = await res.text();
+      let json: unknown;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = undefined;
+      }
+      outcome = { status: res.status, json };
+    } catch (err) {
+      const base = err instanceof Error ? err.message : String(err);
+      const cause = err instanceof Error ? (err.cause ?? undefined) : undefined;
+      const detail = cause instanceof Error ? cause.message : cause ? String(cause) : undefined;
+      const message =
+        detail && detail !== base ? `${base} (${detail})` : base;
+      outcome = { status: 0, error: message };
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
-    return { status: res.status, json };
-  } catch (err) {
-    return { status: 0, error: err instanceof Error ? err.message : String(err) };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
+
+    const retryable =
+      !signal?.aborted &&
+      attempt < MAX_RETRIES &&
+      (outcome.status === 0 || RETRYABLE_STATUS.has(outcome.status));
+    if (!retryable) return outcome;
+    await delay(RETRY_BASE_DELAY_MS * (attempt + 1), signal);
   }
 }
 
