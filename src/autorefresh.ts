@@ -21,6 +21,7 @@
  */
 
 import { existsSync, readFileSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { basename, dirname } from "node:path";
 import { AUTH_PATH, MODELS_STORE_PATH, type GatewayConfig, type GatewayConfigFile } from "./config.ts";
 import { discoverGateway } from "./discovery.ts";
 
@@ -181,8 +182,10 @@ export async function refreshStaleGateways(
 
 /**
  * Watch pi's models-store.json for writes from other pi sessions.
- * Returns a stop function. Best-effort: if the file does not exist yet or
- * watching fails, the watcher is inactive.
+ * Watches the containing directory (not the file): pi writes the store
+ * in-place, but atomic rename replacements (this extension's own writes,
+ * other tools) swap the inode and would silently kill a file-level
+ * inotify watch. Returns a stop function. Best-effort.
  */
 export function startStoreWatcher(opts: {
   getGatewayIds: () => string[];
@@ -191,8 +194,11 @@ export function startStoreWatcher(opts: {
   let watcher: FSWatcher | undefined;
   let debounce: NodeJS.Timeout | undefined;
   try {
-    if (existsSync(MODELS_STORE_PATH)) {
-      watcher = watch(MODELS_STORE_PATH, { persistent: false }, () => {
+    const dir = dirname(MODELS_STORE_PATH);
+    const fileName = basename(MODELS_STORE_PATH);
+    if (existsSync(dir)) {
+      watcher = watch(dir, { persistent: false }, (_eventType, changed) => {
+        if (changed && changed !== fileName) return;
         if (debounce) clearTimeout(debounce);
         debounce = setTimeout(() => {
           if (isSelfWrite()) return;
