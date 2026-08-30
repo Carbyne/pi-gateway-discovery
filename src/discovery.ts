@@ -307,8 +307,10 @@ function getBuiltinIndex(): BuiltinIndex {
         else map.set(key, [model]);
       };
       push(byId, model.id);
+      // Index by last segment for ALL ids — including slash-less ones, so
+      // gateway-prefixed ids like "models/gemini-flash-lite-latest" can match.
       const slash = model.id.lastIndexOf("/");
-      if (slash >= 0) push(bySuffix, model.id.slice(slash + 1));
+      push(bySuffix, slash >= 0 ? model.id.slice(slash + 1) : model.id);
     }
   }
   builtinIndex = { byId, bySuffix, all };
@@ -404,7 +406,9 @@ function isNonChatModel(id: string): boolean {
     /(^|[/:._-])(embed|embedding|bge|gte|e5|rerank)([/:._-]|$)/u.test(normalized) ||
     normalized.includes("nomic-embed") ||
     /(^|[/:._-])(tts|whisper|transcribe|speech|audio)([/:._-]|$)/u.test(normalized) ||
-    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage)([/:._-]|$)/u.test(normalized)
+    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage)([/:._-]|$)/u.test(normalized) ||
+    // Gemini-specific generation/live families (veo=video, lyria=music)
+    /(^|[/:._-])(veo|lyria|robotics|live)([/:._-]|$)/u.test(normalized)
   );
 }
 

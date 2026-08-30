@@ -28,8 +28,13 @@ For each configured gateway the extension:
 Each model gets: context window, max output tokens, input modalities
 (text/image), reasoning flag, cost (OpenRouter-style `pricing`, LiteLLM
 `*_cost_per_token`, built-in catalog, or zero), and — when matched — the
-built-in `thinkingLevelMap` and `compat` flags. Embedding/reranker models
-and user-excluded ids are never registered.
+built-in `thinkingLevelMap` and `compat` flags. Metadata is read from
+OpenAI-style fields (`context_length`, `architecture`, `supported_parameters`),
+Mistral-style fields (`max_context_length`, `capabilities`), Anthropic-style
+fields (`display_name`, `max_input_tokens`, `max_tokens`), and LiteLLM
+`/model/info` enrichment. Non-chat models (embeddings, TTS, transcription,
+moderation, OCR, image/video/music generation, live/robotics) and
+user-excluded ids are never registered.
 
 ## Security model
 
@@ -65,16 +70,21 @@ The AI can drive the same operations through the `gateways` tool
 
 ### Example: the yoda gateway
 
-```
+```sh
 /gw add https://yoda.teknologisk.dk/public/api-gateway/yoda
 /login yoda
 /gw list
 ```
 
-```
+```sh
 yoda (openai-completions) https://yoda.teknologisk.dk/public/api-gateway/yoda
   1 models, 0 matched, 1 unmatched (just now)
 ```
+
+If a gateway exposes its OpenAI-compatible interface under a subpath (e.g.
+`.../gemini/v1beta/openai`), just include the subpath in the base URL —
+discovery probes `{base}/models` and `{base}/v1/models` and uses whichever
+answers as the inference base.
 
 ## Configuration
 
