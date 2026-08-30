@@ -591,6 +591,26 @@ function mapGatewayModel(
     model.compat = { ...(model.compat ?? {}), ...gateway.compat };
   }
 
+  // Per-model overrides are the topmost layer (protocol routing, thinking
+  // levels, sizes, compat).
+  const override = gateway.modelOverrides?.[id];
+  if (override) {
+    if (override.api) {
+      model.api = override.api;
+      // Anthropic SDKs append /v1/messages — keep the base URL consistent.
+      if (override.api === "anthropic-messages") {
+        model.baseUrl = inferenceBaseUrlForApi(model.baseUrl, override.api);
+      }
+    }
+    if (override.reasoning !== undefined) model.reasoning = override.reasoning;
+    if (override.contextWindow !== undefined) model.contextWindow = override.contextWindow;
+    if (override.maxTokens !== undefined) {
+      model.maxTokens = Math.min(override.maxTokens, model.contextWindow);
+    }
+    if (override.thinkingLevelMap) model.thinkingLevelMap = override.thinkingLevelMap;
+    if (override.compat) model.compat = { ...(model.compat ?? {}), ...override.compat };
+  }
+
   return {
     model,
     source: builtin ? `builtin:${builtin.provider}/${builtin.id}` : "gateway",

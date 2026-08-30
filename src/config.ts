@@ -13,6 +13,19 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type GatewayApi = "openai-completions" | "openai-responses" | "anthropic-messages";
 
+/** Per-model overrides (topmost layer over gateway-level settings). */
+export interface ModelOverride {
+  /** Route this model to a different protocol than the gateway default. */
+  api?: GatewayApi;
+  reasoning?: boolean;
+  contextWindow?: number;
+  maxTokens?: number;
+  /** Replace the inherited thinking-level map (null marks a level unsupported). */
+  thinkingLevelMap?: Record<string, string | null>;
+  /** Merged over inherited/gateway compat. */
+  compat?: Record<string, unknown>;
+}
+
 export interface GatewayConfig {
   /** Stable id. Doubles as the pi provider id and the auth.json credential key. */
   id: string;
@@ -31,6 +44,8 @@ export interface GatewayConfig {
    * which rejects the `store` parameter pi sends to unknown endpoints.
    */
   compat?: Record<string, unknown>;
+  /** Per-model overrides, keyed by model id (topmost layer). */
+  modelOverrides?: Record<string, ModelOverride>;
   /** Model ids to never register. */
   excludedModels?: string[];
 }
@@ -47,6 +62,58 @@ export const MODELS_STORE_PATH = join(AGENT_DIR, "models-store.json");
 
 export function isGatewayApi(value: unknown): value is GatewayApi {
   return value === "openai-completions" || value === "openai-responses" || value === "anthropic-messages";
+}
+
+function parseModelOverrides(value: unknown): Record<string, ModelOverride> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out: Record<string, ModelOverride> = {};
+  for (const [modelId, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`Invalid model override for ${modelId}`);
+    }
+    const item = raw as Record<string, unknown>;
+    const override: ModelOverride = {};
+    if (item.api !== undefined) {
+      if (!isGatewayApi(item.api)) throw new Error(`Invalid api in override for ${modelId}`);
+      override.api = item.api;
+    }
+    if (item.reasoning !== undefined) {
+      if (typeof item.reasoning !== "boolean") throw new Error(`Invalid reasoning in override for ${modelId}`);
+      override.reasoning = item.reasoning;
+    }
+    for (const field of ["contextWindow", "maxTokens"] as const) {
+      if (item[field] !== undefined) {
+        const n = asPositiveNumber(item[field]);
+        if (n === undefined) throw new Error(`Invalid ${field} in override for ${modelId}`);
+        override[field] = n;
+      }
+    }
+    if (item.thinkingLevelMap !== undefined) {
+      if (!item.thinkingLevelMap || typeof item.thinkingLevelMap !== "object" || Array.isArray(item.thinkingLevelMap)) {
+        throw new Error(`Invalid thinkingLevelMap in override for ${modelId}`);
+      }
+      const map: Record<string, string | null> = {};
+      for (const [level, v] of Object.entries(item.thinkingLevelMap as Record<string, unknown>)) {
+        if (v !== null && typeof v !== "string") {
+          throw new Error(`Invalid thinkingLevelMap value for level '${level}' in override for ${modelId}`);
+        }
+        map[level] = v as string | null;
+      }
+      override.thinkingLevelMap = map;
+    }
+    if (item.compat !== undefined) {
+      if (!item.compat || typeof item.compat !== "object" || Array.isArray(item.compat)) {
+        throw new Error(`Invalid compat in override for ${modelId}`);
+      }
+      override.compat = item.compat as Record<string, unknown>;
+    }
+    if (Object.keys(override).length > 0) out[modelId] = override;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function asPositiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +216,7 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
       ...(item.compat && typeof item.compat === "object" && !Array.isArray(item.compat)
         ? { compat: item.compat as Record<string, unknown> }
         : {}),
+      ...(parseModelOverrides(item.modelOverrides) ? { modelOverrides: parseModelOverrides(item.modelOverrides) } : {}),
       ...(excludedModels && excludedModels.length > 0 ? { excludedModels } : {}),
     };
   });

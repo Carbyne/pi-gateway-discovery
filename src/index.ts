@@ -51,6 +51,7 @@ import {
   type GatewayApi,
   type GatewayConfig,
   type GatewayConfigFile,
+  type ModelOverride,
 } from "./config.ts";
 import { discoverGateway } from "./discovery.ts";
 
@@ -253,7 +254,7 @@ async function cleanupGatewayState(
 
 async function addGateway(
   pi: ExtensionAPI,
-  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string },
+  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; compat?: Record<string, unknown> },
   ctx: Pick<ExtensionCommandContext, "modelRegistry">,
 ): Promise<Record<string, unknown>> {
   if (!params.baseUrl) throw new Error("baseUrl is required for action=add");
@@ -275,6 +276,12 @@ async function addGateway(
     baseUrl: normalizeBaseUrl(params.baseUrl),
     ...(managed?.api ? { api: managed.api } : {}),
     ...(params.apiKeyEnv?.trim() ? { apiKeyEnv: params.apiKeyEnv.trim() } : managed?.apiKeyEnv ? { apiKeyEnv: managed.apiKeyEnv } : {}),
+    ...(params.compat && Object.keys(params.compat).length > 0
+      ? { compat: params.compat }
+      : managed?.compat
+        ? { compat: managed.compat }
+        : {}),
+    ...(managed?.modelOverrides ? { modelOverrides: managed.modelOverrides } : {}),
     ...(managed?.excludedModels ? { excludedModels: managed.excludedModels } : {}),
   };
   await saveAndRegister(pi, gateway, ctx);
@@ -350,6 +357,63 @@ function summarizeSync(id: string): Record<string, unknown> {
   };
 }
 
+/**
+ * Set or clear per-model overrides for a gateway (topmost metadata layer).
+ * Re-registers the provider and forces a refresh so the new overrides are
+ * baked into the model cache.
+ */
+async function overrideModel(
+  pi: ExtensionAPI,
+  params: {
+    gatewayId?: string;
+    modelId?: string;
+    api?: GatewayApi;
+    reasoning?: boolean;
+    contextWindow?: number;
+    maxTokens?: number;
+    thinkingLevelMap?: Record<string, string | null>;
+    compat?: Record<string, unknown>;
+    clear?: boolean;
+  },
+  ctx: Pick<ExtensionCommandContext, "modelRegistry">,
+): Promise<Record<string, unknown>> {
+  if (!params.gatewayId) throw new Error("gatewayId is required for action=override");
+  const gatewayId = validateGatewayId(params.gatewayId);
+  const gateway = configFile.gateways.find((g) => g.id === gatewayId);
+  if (!gateway) throw new Error(`Unknown gateway: ${gatewayId}`);
+
+  const overrides: Record<string, ModelOverride> = { ...(gateway.modelOverrides ?? {}) };
+  if (params.clear) {
+    if (params.modelId) delete overrides[params.modelId];
+    else for (const key of Object.keys(overrides)) delete overrides[key];
+  } else {
+    if (!params.modelId) throw new Error("modelId is required for action=override");
+    const next: ModelOverride = { ...overrides[params.modelId] };
+    if (params.api !== undefined) next.api = params.api;
+    if (params.reasoning !== undefined) next.reasoning = params.reasoning;
+    if (params.contextWindow !== undefined) next.contextWindow = params.contextWindow;
+    if (params.maxTokens !== undefined) next.maxTokens = params.maxTokens;
+    if (params.thinkingLevelMap !== undefined) next.thinkingLevelMap = params.thinkingLevelMap;
+    if (params.compat !== undefined) next.compat = { ...(next.compat ?? {}), ...params.compat };
+    overrides[params.modelId] = next;
+  }
+
+  const updated: GatewayConfig = {
+    ...gateway,
+    ...(Object.keys(overrides).length > 0 ? { modelOverrides: overrides } : { modelOverrides: undefined }),
+  };
+  configFile = { version: 1, gateways: configFile.gateways.map((g) => (g.id === gatewayId ? updated : g)) };
+  await saveConfig(configFile);
+  pi.registerProvider(makeProvider(updated));
+  await ctx.modelRegistry.refresh({ providers: [gatewayId], force: true });
+
+  return {
+    gateway: gatewayId,
+    model: params.modelId ?? "(all)",
+    modelOverrides: updated.modelOverrides ?? {},
+  };
+}
+
 function listGateways(ctx: Pick<ExtensionCommandContext, "modelRegistry">): Record<string, unknown> {
   const builtIn = new Set(ctx.modelRegistry.getAll().map((model) => model.provider));
   return {
@@ -390,9 +454,9 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // -------------------------------------------------------------------------
 
   pi.registerCommand("gw", {
-    description: "Gateway model discovery: /gw add <url> [id] | remove <id> | sync [id] | list",
+    description: "Gateway model discovery: /gw add <url> [id] | remove <id> | sync [id] | list | override <id> <model> [k=v ...]",
     getArgumentCompletions: (prefix) => {
-      const subcommands = ["add", "remove", "sync", "list"].filter((c) => c.startsWith(prefix));
+      const subcommands = ["add", "remove", "sync", "list", "override"].filter((c) => c.startsWith(prefix));
       if (subcommands.length > 0) return subcommands.map((value) => ({ value, label: value }));
       const gateways = configFile.gateways
         .filter((g) => g.id.startsWith(prefix))
@@ -415,11 +479,86 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
         case undefined:
           cmdList(ctx);
           break;
+        case "override":
+          await cmdOverride(pi, rest, ctx);
+          break;
         default:
-          ctx.ui.notify("Usage: /gw add <baseUrl> [id] | /gw remove <id> | /gw sync [id] | /gw list", "warning");
+          ctx.ui.notify(
+            "Usage: /gw add <baseUrl> [id] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
+            "warning",
+          );
       }
     },
   });
+
+  async function cmdOverride(pi: ExtensionAPI, rest: string[], ctx: ExtensionCommandContext): Promise<void> {
+    const [gatewayId, modelId, ...kv] = rest;
+    if (!gatewayId || !modelId) {
+      ctx.ui.notify(
+        "Usage: /gw override <gatewayId> <modelId> [api=... reasoning=true|false contextWindow=N maxTokens=N thinkingLevelMap={json} compat={json}] | /gw override <gatewayId> <modelId> clear",
+        "warning",
+      );
+      return;
+    }
+    try {
+      const params: {
+        gatewayId: string;
+        modelId: string;
+        clear?: boolean;
+        api?: GatewayApi;
+        reasoning?: boolean;
+        contextWindow?: number;
+        maxTokens?: number;
+        thinkingLevelMap?: Record<string, string | null>;
+        compat?: Record<string, unknown>;
+      } = { gatewayId, modelId };
+      for (const token of kv) {
+        if (token === "clear") {
+          params.clear = true;
+          continue;
+        }
+        const eq = token.indexOf("=");
+        if (eq <= 0) throw new Error(`Invalid override token: ${token}`);
+        const key = token.slice(0, eq);
+        const value = token.slice(eq + 1);
+        switch (key) {
+          case "api":
+            if (value !== "openai-completions" && value !== "openai-responses" && value !== "anthropic-messages") {
+              throw new Error(`Invalid api value: ${value}`);
+            }
+            params.api = value;
+            break;
+          case "reasoning":
+            if (value !== "true" && value !== "false") throw new Error(`Invalid reasoning value: ${value}`);
+            params.reasoning = value === "true";
+            break;
+          case "contextWindow":
+          case "maxTokens": {
+            const n = Number(value);
+            if (!Number.isFinite(n) || n <= 0) throw new Error(`Invalid ${key} value: ${value}`);
+            params[key] = n;
+            break;
+          }
+          case "thinkingLevelMap":
+          case "compat": {
+            const parsed: unknown = JSON.parse(value);
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+              throw new Error(`${key} must be a JSON object`);
+            }
+            if (key === "thinkingLevelMap") params.thinkingLevelMap = parsed as Record<string, string | null>;
+            else params.compat = parsed as Record<string, unknown>;
+            break;
+          }
+          default:
+            throw new Error(`Unknown override key: ${key}`);
+        }
+      }
+      const result = await overrideModel(pi, params, ctx);
+      ctx.ui.notify(`Override updated for ${result.gateway}/${result.model}`, "info");
+    } catch (error) {
+      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    }
+  }
 
   async function cmdAdd(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
     if (!ctx.hasUI) {
@@ -553,14 +692,34 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     name: "gateways",
     label: "Gateway Models",
     description:
-      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway, remove it (including stored credential and model cache), force a model-list sync, or list gateways with their last sync status. API keys are only entered via pi /login or env vars — this tool never accepts or exposes keys.",
-    promptSnippet: "Add, remove, sync, or inspect model-discovery gateways",
+      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway, remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides (api protocol, reasoning, contextWindow, maxTokens, thinkingLevelMap, compat), or list gateways with their last sync status. API keys are only entered via pi /login or env vars — this tool never accepts or exposes keys.",
+    promptSnippet: "Add, remove, sync, override, or inspect model-discovery gateways",
     parameters: Type.Object({
-      action: StringEnum(["add", "remove", "sync", "list"] as const),
+      action: StringEnum(["add", "remove", "sync", "list", "override"] as const),
       baseUrl: Type.Optional(Type.String({ description: "Gateway base URL for action=add" })),
-      gatewayId: Type.Optional(Type.String({ description: "Gateway id for add/remove/sync" })),
+      gatewayId: Type.Optional(Type.String({ description: "Gateway id for add/remove/sync/override" })),
       displayName: Type.Optional(Type.String({ description: "Display name for action=add" })),
       apiKeyEnv: Type.Optional(Type.String({ description: "Env var name holding the API key (alternative to /login)" })),
+      compat: Type.Optional(
+        Type.Record(Type.String(), Type.Unknown(), { description: "Gateway-level compat overrides (action=add) or merged into the model override (action=override)" }),
+      ),
+      modelId: Type.Optional(Type.String({ description: "Model id for action=override" })),
+      api: Type.Optional(
+        StringEnum(["openai-completions", "openai-responses", "anthropic-messages"] as const, {
+          description: "Route a model to a different protocol (action=override)",
+        }),
+      ),
+      reasoning: Type.Optional(Type.Boolean({ description: "Force reasoning on/off for a model (action=override)" })),
+      contextWindow: Type.Optional(Type.Number({ description: "Override context window (action=override)" })),
+      maxTokens: Type.Optional(Type.Number({ description: "Override max output tokens (action=override)" })),
+      thinkingLevelMap: Type.Optional(
+        Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()], { description: "Level map value" }), {
+          description: "Replace the model's thinking-level map; null marks a level unsupported (action=override)",
+        }),
+      ),
+      clear: Type.Optional(
+        Type.Boolean({ description: "Clear the override for modelId (or all overrides when modelId is omitted) (action=override)" }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       let result: unknown;
@@ -573,6 +732,9 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           break;
         case "sync":
           result = await syncGateways(params, ctx);
+          break;
+        case "override":
+          result = await overrideModel(pi, params, ctx);
           break;
         default:
           result = listGateways(ctx);

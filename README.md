@@ -112,6 +112,10 @@ answers as the inference base.
       "baseUrl": "https://yoda.teknologisk.dk/public/api-gateway/yoda",
       "api": "openai-completions",
       "apiKeyEnv": "YODA_API_KEY",
+      "compat": { "supportsStore": false },
+      "modelOverrides": {
+        "gpt-5.6-terra": { "api": "openai-responses" }
+      },
       "excludedModels": ["some/model"]
     }
   ]
@@ -124,8 +128,9 @@ answers as the inference base.
 | `name` | Display name. |
 | `baseUrl` | Gateway base URL (no trailing slash). |
 | `api` | `openai-completions` (default), `openai-responses`, or `anthropic-messages`. A trailing `/v1` is stripped for anthropic. |
-| `apiKeyEnv` | Optional env var holding the API key (checked before the stored credential… actually the stored credential wins at request time; the env var is checked first in discovery). |
+| `apiKeyEnv` | Optional env var holding the API key (used for discovery; the stored `/login` credential wins at request time). |
 | `compat` | Per-gateway compat overrides merged into every discovered model (e.g. `{ "supportsStore": false }` for gateways fronting the strict Mistral API, which rejects pi's `store` parameter). |
+| `modelOverrides` | Per-model overrides keyed by model id (topmost layer): `api` (route to a different protocol, e.g. `openai-responses`), `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` (null marks a level unsupported), `compat`. Manageable via the `gateways` tool (`action: "override"`) or `/gw override <id> <model> [k=v ...]`. |
 | `excludedModels` | Model ids to never register. |
 
 ## Design notes

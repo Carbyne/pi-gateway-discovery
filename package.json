@@ -1,6 +1,6 @@
 {
   "name": "pi-gateway-discovery",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Pi extension: dynamic model discovery for OpenAI-compatible and LiteLLM API gateways",
   "type": "module",
   "main": "./src/index.ts",
