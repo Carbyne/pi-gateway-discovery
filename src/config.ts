@@ -52,6 +52,14 @@ export interface GatewayConfig {
 
 export interface GatewayConfigFile {
   version: 1;
+  /**
+   * Auto-refresh TTL in hours. When the cached catalog for a gateway is
+   * older than this, pi refreshes it automatically: at extension load (all
+   * modes, including `pi --list-models` and `pi -p`), on /reload, and
+   * periodically in long-running sessions. 0 disables auto-refresh.
+   * Default: 1.
+   */
+  autoRefreshTtlHours?: number;
   gateways: GatewayConfig[];
 }
 
@@ -190,9 +198,17 @@ export function suggestGatewayIdentity(
 
 function parseConfigFile(value: unknown): GatewayConfigFile {
   if (!value || typeof value !== "object") throw new Error("Configuration must be a JSON object");
-  const input = value as { version?: unknown; gateways?: unknown };
+  const input = value as { version?: unknown; gateways?: unknown; autoRefreshTtlHours?: unknown };
   if (input.version !== 1 || !Array.isArray(input.gateways)) {
     throw new Error("Unsupported gateway-discovery config version");
+  }
+
+  let autoRefreshTtlHours: number | undefined;
+  if (input.autoRefreshTtlHours !== undefined) {
+    if (typeof input.autoRefreshTtlHours !== "number" || !Number.isFinite(input.autoRefreshTtlHours) || input.autoRefreshTtlHours < 0) {
+      throw new Error("autoRefreshTtlHours must be a non-negative number");
+    }
+    autoRefreshTtlHours = input.autoRefreshTtlHours;
   }
 
   const gateways = input.gateways.map((entry, index) => {
@@ -221,7 +237,7 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
     };
   });
 
-  return { version: 1, gateways };
+  return { version: 1, ...(autoRefreshTtlHours !== undefined ? { autoRefreshTtlHours } : {}), gateways };
 }
 
 export async function loadConfig(): Promise<GatewayConfigFile> {

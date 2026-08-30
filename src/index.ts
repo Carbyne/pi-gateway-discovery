@@ -53,6 +53,16 @@ import {
   type GatewayConfigFile,
   type ModelOverride,
 } from "./config.ts";
+import {
+  AUTO_REFRESH_DEFAULT_TTL_HOURS,
+  PERIODIC_CHECK_INTERVAL_MS,
+  isOffline,
+  markSelfWrite,
+  refreshStaleGateways,
+  staleGatewayIds,
+  startStoreWatcher,
+  ttlMsFromConfig,
+} from "./autorefresh.ts";
 import { discoverGateway } from "./discovery.ts";
 
 // ---------------------------------------------------------------------------
@@ -64,6 +74,7 @@ interface SyncInfo {
   syncedAt: number;
   modelCount?: number;
   matchedCount?: number;
+  unmatchedCount?: number;
   unmatched?: Array<{ id: string; candidates: string[] }>;
   inferenceBaseUrl?: string;
   healthyEndpoints?: number;
@@ -147,6 +158,23 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
     },
     fetchModels: async (context) => {
       if (!context.allowNetwork) return [];
+
+      // In-process TTL gate: serve the cached catalog when this session
+      // already fetched recently. Prevents a duplicate network fetch when
+      // pi's own background refresh follows the factory auto-refresh; pi
+      // documents `force` as "bypass provider freshness checks".
+      const ttlMs = ttlMsFromConfig(configFile);
+      const last = lastSync.get(gateway.id);
+      if (
+        !context.force &&
+        ttlMs > 0 &&
+        last?.ok &&
+        Date.now() - last.syncedAt < ttlMs &&
+        context.stored &&
+        context.stored.models.length > 0
+      ) {
+        return context.stored.models.filter((m) => m.provider === gateway.id);
+      }
 
       const credential = context.credential;
       const key =
@@ -349,7 +377,7 @@ function summarizeSync(id: string): Record<string, unknown> {
     at: ageMs(info.syncedAt),
     models: info.modelCount,
     matched: info.matchedCount,
-    unmatched: info.unmatched?.length ?? 0,
+    unmatched: info.unmatchedCount ?? info.unmatched?.length ?? 0,
     litellmEnriched: info.litellmEnriched,
     ...(info.healthyEndpoints !== undefined
       ? { healthyEndpoints: info.healthyEndpoints, unhealthyEndpoints: info.unhealthyEndpoints ?? 0 }
@@ -416,7 +444,13 @@ async function overrideModel(
 
 function listGateways(ctx: Pick<ExtensionCommandContext, "modelRegistry">): Record<string, unknown> {
   const builtIn = new Set(ctx.modelRegistry.getAll().map((model) => model.provider));
+  const ttlMs = ttlMsFromConfig(configFile);
   return {
+    autoRefresh: {
+      ttlHours: configFile.autoRefreshTtlHours ?? AUTO_REFRESH_DEFAULT_TTL_HOURS,
+      offline: isOffline(),
+      stale: staleGatewayIds(configFile, ttlMs),
+    },
     gateways: configFile.gateways.map((gateway) => ({
       id: gateway.id,
       name: gateway.name,
@@ -448,6 +482,64 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       console.error(`[gateway-discovery] Failed to register ${gateway.id}: ${errorMessage(error)}`);
     }
   }
+
+  // Auto-refresh: re-discover gateways whose cached catalog is older than
+  // the TTL. pi awaits the factory and restores the cache from the store
+  // after registration, so every mode — including `pi --list-models` and
+  // `pi -p` — starts with a fresh model list. Fresh cache → zero delay.
+  if (configFile.gateways.length > 0 && !isOffline()) {
+    try {
+      await refreshStaleGateways(configFile, (id, info) => {
+        lastSync.set(id, {
+          ok: info.ok,
+          syncedAt: Date.now(),
+          ...(info.modelCount !== undefined ? { modelCount: info.modelCount } : {}),
+          ...(info.matchedCount !== undefined ? { matchedCount: info.matchedCount } : {}),
+          ...(info.unmatchedCount !== undefined ? { unmatchedCount: info.unmatchedCount } : {}),
+          ...(info.inferenceBaseUrl ? { inferenceBaseUrl: info.inferenceBaseUrl } : {}),
+          ...(info.litellmEnriched !== undefined ? { litellmEnriched: info.litellmEnriched } : {}),
+          ...(info.error ? { error: info.error } : {}),
+        });
+      });
+    } catch (error) {
+      console.error(`[gateway-discovery] auto-refresh failed: ${errorMessage(error)}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-session propagation + periodic refresh (sessions only)
+  // -------------------------------------------------------------------------
+
+  let stopStoreWatcher: (() => void) | undefined;
+  let periodicTimer: NodeJS.Timeout | undefined;
+
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
+    stopStoreWatcher?.();
+    stopStoreWatcher = startStoreWatcher({
+      getGatewayIds: () => configFile.gateways.map((g) => g.id),
+      onExternalChange: (ids) => {
+        // Offline refresh: pi re-reads the store (file revision changed)
+        // and publishes the restored catalog to this session's registry.
+        void ctx.modelRegistry.refresh({ providers: ids, allowNetwork: false }).catch(() => {});
+      },
+    });
+    if (periodicTimer) clearInterval(periodicTimer);
+    periodicTimer = setInterval(() => {
+      const stale = staleGatewayIds(configFile, ttlMsFromConfig(configFile));
+      if (stale.length === 0) return;
+      markSelfWrite(10_000);
+      void ctx.modelRegistry.refresh({ providers: stale, force: true }).catch(() => {});
+    }, PERIODIC_CHECK_INTERVAL_MS);
+    periodicTimer.unref?.();
+  });
+
+  pi.on("session_shutdown", () => {
+    stopStoreWatcher?.();
+    stopStoreWatcher = undefined;
+    if (periodicTimer) clearInterval(periodicTimer);
+    periodicTimer = undefined;
+  });
 
   // -------------------------------------------------------------------------
   // Commands

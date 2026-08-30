@@ -105,6 +105,7 @@ answers as the inference base.
 ```json
 {
   "version": 1,
+  "autoRefreshTtlHours": 1,
   "gateways": [
     {
       "id": "yoda",
@@ -124,6 +125,7 @@ answers as the inference base.
 
 | Field | Meaning |
 |---|---|
+| `autoRefreshTtlHours` | Auto-refresh TTL (top-level). When a gateway's cached catalog is older than this, it is refreshed automatically — at pi load (all modes, including `pi --list-models` and `pi -p`), on `/reload`, and periodically in long-running sessions. `0` disables auto-refresh. Default: `1`. |
 | `id` | Provider id (lowercase `[a-z0-9._-]`). Doubles as the `/login` credential key. |
 | `name` | Display name. |
 | `baseUrl` | Gateway base URL (no trailing slash). |
@@ -132,6 +134,30 @@ answers as the inference base.
 | `compat` | Per-gateway compat overrides merged into every discovered model (e.g. `{ "supportsStore": false }` for gateways fronting the strict Mistral API, which rejects pi's `store` parameter). |
 | `modelOverrides` | Per-model overrides keyed by model id (topmost layer): `api` (route to a different protocol, e.g. `openai-responses`), `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` (null marks a level unsupported), `compat`. Manageable via the `gateways` tool (`action: "override"`) or `/gw override <id> <model> [k=v ...]`. |
 | `excludedModels` | Model ids to never register. |
+
+## Automatic updates
+
+pi itself refreshes model catalogs in the background for interactive and RPC
+sessions, but `pi --list-models` and `pi -p` never touch the network. This
+extension closes that gap with a TTL-based auto-refresh
+(`autoRefreshTtlHours`, default 1h, `0` disables):
+
+- **On load (all modes)** — the extension factory (which pi awaits) checks
+  the cached catalog age and re-discovers stale gateways *before* pi
+  restores the cache, so `pi --list-models` and `pi -p` start with a fresh
+  model list. A fresh cache costs nothing (no network, no delay). The
+  refresh is bounded by a 15s timeout and never blocks startup on failure —
+  the stale cache is used instead.
+- **On `/reload`** — the factory runs again, same logic.
+- **Cross-session** — each interactive/RPC session watches
+  `models-store.json`; when another pi session rewrites it (its own
+  auto-refresh, a `/gw sync`, …), this session re-reads the store and
+  updates its in-memory registry, so running sessions pick up new models
+  without a restart.
+- **Long-running sessions** — a periodic check (every 5 min, unref'd) forces
+  a refresh once the TTL has passed.
+
+`PI_OFFLINE=1` disables all auto-refresh network access.
 
 ## Design notes
 
