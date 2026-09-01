@@ -598,13 +598,14 @@ function mapGatewayModel(
     maxTokens,
   };
 
-  // Inherit thinking levels and compat flags from the matched catalog entry,
-  // then apply the gateway's compat overrides (e.g. supportsStore:false for
-  // strict backends like the Mistral API).
-  if (builtin) {
-    if (builtin.thinkingLevelMap) model.thinkingLevelMap = builtin.thinkingLevelMap;
-    if (builtin.compat) model.compat = builtin.compat;
-  }
+  // Do NOT inherit compat/thinkingLevelMap from the matched catalog entry:
+  // the suffix match crosses vendors (a gateway-served "qwen3.8-27b" matches
+  // the Cloudflare/OpenRouter catalog entries), and those flags describe the
+  // vendor's API endpoint, not the model — e.g. Cloudflare's
+  // supportsReasoningEffort:false is wrong for a vLLM backend that does
+  // accept reasoning_effort. pi core derives endpoint-appropriate defaults
+  // from provider/baseUrl; set explicit values via gateway compat or the
+  // per-model overrides below.
   if (gateway.compat && Object.keys(gateway.compat).length > 0) {
     model.compat = { ...(model.compat ?? {}), ...gateway.compat };
   }
