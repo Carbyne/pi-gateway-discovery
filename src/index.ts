@@ -12,10 +12,10 @@
  * config file or in AI-visible output.
  *
  * Commands:
- *   /gw add <baseUrl> [id]   Register a gateway (then /login <id>)
- *   /gw remove <id>          Remove a gateway, its credential, and its cache
- *   /gw sync [id]            Force a model-list refresh
- *   /gw list                 Show gateways and last sync status
+ *   /gw add <baseUrl> [id] [token]  Register a gateway with optional API token
+ *   /gw remove <id>                 Remove a gateway, its credential, and its cache
+ *   /gw sync [id]                   Force a model-list refresh
+ *   /gw list                         Show gateways and last sync status
  *
  * Tool: `gateways` — the same operations for AI-driven setup.
  */
@@ -289,7 +289,7 @@ async function cleanupGatewayState(
 
 async function addGateway(
   pi: ExtensionAPI,
-  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; compat?: Record<string, unknown> },
+  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; apiToken?: string; compat?: Record<string, unknown> },
   ctx: Pick<ExtensionCommandContext, "modelRegistry">,
 ): Promise<Record<string, unknown>> {
   if (!params.baseUrl) throw new Error("baseUrl is required for action=add");
@@ -321,10 +321,26 @@ async function addGateway(
   };
   await saveAndRegister(pi, gateway, ctx);
 
+  // If an API token was provided, store it in auth.json
+  if (params.apiToken?.trim()) {
+    const auth = await (async () => {
+      try {
+        const content = await Deno.readTextFile(AUTH_PATH);
+        return JSON.parse(content) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    })();
+    auth[id] = { type: "api_key", key: params.apiToken.trim() };
+    await Deno.writeTextFile(AUTH_PATH, JSON.stringify(auth, null, 2));
+  }
+
   return {
     gateway,
-    nextStep: `/login ${id}`,
-    note: "Enter the API key through pi /login (or set the apiKeyEnv env var); keys are never stored in the config file.",
+    nextStep: params.apiToken ? undefined : `/login ${id}`,
+    note: params.apiToken 
+      ? "API key has been stored and is ready to use."
+      : "Enter the API key through pi /login (or set the apiKeyEnv env var); keys are never stored in the config file.",
   };
 }
 
@@ -483,7 +499,7 @@ async function selfHealUnknownModel(
 ): Promise<void> {
   const gatewayIds = configFile.gateways.map((g) => g.id);
   if (gatewayIds.length > 0) {
-    // Offline refresh re-reads the store (its file revision changed when the
+    // Offline refresh: pi re-reads the store (its file revision changed when the
     // in-flight write completed) and republishes the cached catalogs.
     void ctx.modelRegistry.refresh({ providers: gatewayIds, allowNetwork: false }).catch(() => {});
   }
@@ -620,7 +636,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // -------------------------------------------------------------------------
 
   pi.registerCommand("gw", {
-    description: "Gateway model discovery: /gw add <url> [id] | remove <id> | sync [id] | list | override <id> <model> [k=v ...]",
+    description: "Gateway model discovery: /gw add <url> [id] [token] | remove <id> | sync [id] | list | override <id> <model> [k=v ...]",
     getArgumentCompletions: (prefix) => {
       const subcommands = ["add", "remove", "sync", "list", "override"].filter((c) => c.startsWith(prefix));
       if (subcommands.length > 0) return subcommands.map((value) => ({ value, label: value }));
@@ -650,7 +666,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           break;
         default:
           ctx.ui.notify(
-            "Usage: /gw add <baseUrl> [id] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
+            "Usage: /gw add <baseUrl> [id] [token] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
             "warning",
           );
       }
@@ -731,7 +747,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       ctx.ui.notify("/gw add requires interactive or RPC UI mode (or use the gateways tool)", "error");
       return;
     }
-    const [rawUrl, rawId] = args.trim().split(/\s+/u);
+    const [rawUrl, rawId, rawToken] = args.trim().split(/\s+/u);
 
     let baseUrl = rawUrl;
     if (!baseUrl) {
@@ -750,11 +766,21 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       id = promptedId;
     }
 
+    let token = rawToken;
+    if (!token && ctx.hasUI) {
+      const promptedToken = await ctx.ui.input("API token (or leave blank to set later with /login)", "");
+      token = promptedToken || undefined;
+    }
+
     try {
-      const result = await addGateway(pi, { baseUrl, gatewayId: id }, ctx);
+      const result = await addGateway(pi, { baseUrl, gatewayId: id, apiToken: token }, ctx);
       const gateway = result.gateway as GatewayConfig;
-      ctx.ui.notify(`Registered gateway '${gateway.id}' (${gateway.name}). Run /login ${gateway.id} to store the API key.`, "info");
-      ctx.ui.setEditorText(`/login ${gateway.id}`);
+      if (token) {
+        ctx.ui.notify(`Registered gateway '${gateway.id}' (${gateway.name}). API key stored.`, "info");
+      } else {
+        ctx.ui.notify(`Registered gateway '${gateway.id}' (${gateway.name}). Run /login ${gateway.id} to store the API key.`, "info");
+        ctx.ui.setEditorText(`/login ${gateway.id}`);
+      }
     } catch (error) {
       ctx.ui.notify(errorMessage(error), "error");
     }
@@ -858,7 +884,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     name: "gateways",
     label: "Gateway Models",
     description:
-      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway, remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides (api protocol, reasoning, contextWindow, maxTokens, thinkingLevelMap, compat), or list gateways with their last sync status. API keys are only entered via pi /login or env vars — this tool never accepts or exposes keys.",
+      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway, remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides, or inspect gateway status.",
     promptSnippet: "Add, remove, sync, override, or inspect model-discovery gateways",
     parameters: Type.Object({
       action: StringEnum(["add", "remove", "sync", "list", "override"] as const),
@@ -866,6 +892,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       gatewayId: Type.Optional(Type.String({ description: "Gateway id for add/remove/sync/override" })),
       displayName: Type.Optional(Type.String({ description: "Display name for action=add" })),
       apiKeyEnv: Type.Optional(Type.String({ description: "Env var name holding the API key (alternative to /login)" })),
+      apiToken: Type.Optional(Type.String({ description: "API token to store immediately (optional, can use /login later)" })),
       compat: Type.Optional(
         Type.Record(Type.String(), Type.Unknown(), { description: "Gateway-level compat overrides (action=add) or merged into the model override (action=override)" }),
       ),
