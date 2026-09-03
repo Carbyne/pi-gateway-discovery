@@ -65,22 +65,22 @@ pi install /path/to/pi-gateway-discovery
 After `/gw add`, pi tells you to run `/login <id>` — enter the API key in
 the secret prompt (it is stored in `auth.json`, never in chat or config).
 The gateway's models then appear as `<id>/<model-id>`, e.g.
-`yoda/qwen3.8-27b`.
+`openai/gpt-4-turbo`.
 
 The AI can drive the same operations through the `gateways` tool
 (`add` / `remove` / `sync` / `list`).
 
-### Example: the yoda gateway
+### Example: the OpenAI gateway
 
 ```sh
-/gw add https://yoda.teknologisk.dk/public/api-gateway/yoda
-/login yoda
+/gw add https://api.openai.com/v1
+/login openai
 /gw list
 ```
 
 ```sh
-yoda (openai-completions) https://yoda.teknologisk.dk/public/api-gateway/yoda
-  1 models, 0 matched, 1 unmatched (just now)
+openai (openai-completions) https://api.openai.com/v1
+  15 models, 15 matched, 0 unmatched (just now)
 ```
 
 If a gateway exposes its OpenAI-compatible interface under a subpath (e.g.
@@ -91,7 +91,7 @@ answers as the inference base.
 > [!NOTE]
 > Gateway ids that match a pi built-in provider (`openai`, `anthropic`,
 > `mistral`, `gemini`, …) **override** that built-in provider for the whole
-> session. Use distinct ids (e.g. `yoda-openai`) when you want to keep the
+> session. Use distinct ids (e.g. `openai-custom`) when you want to keep the
 > built-in catalog alongside the gateway.
 >
 > `pi --list-models` shows the **cached** catalog (no network fetch). The
@@ -108,14 +108,14 @@ answers as the inference base.
   "autoRefreshTtlHours": 1,
   "gateways": [
     {
-      "id": "yoda",
-      "name": "Yoda",
-      "baseUrl": "https://yoda.teknologisk.dk/public/api-gateway/yoda",
+      "id": "openai",
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
       "api": "openai-completions",
-      "apiKeyEnv": "YODA_API_KEY",
+      "apiKeyEnv": "OPENAI_API_KEY",
       "compat": { "supportsStore": false },
       "modelOverrides": {
-        "gpt-5.6-terra": { "api": "openai-responses" }
+        "gpt-4o": { "api": "openai-responses" }
       },
       "excludedModels": ["some/model"]
     }
@@ -125,14 +125,14 @@ answers as the inference base.
 
 | Field | Meaning |
 |---|---|
-| `autoRefreshTtlHours` | Auto-refresh TTL (top-level). When a gateway's cached catalog is older than this, it is refreshed automatically — at pi load (all modes, including `pi --list-models` and `pi -p`), on `/reload`, and periodically in long-running sessions. `0` disables auto-refresh. Default: `1`. |
+| `autoRefreshTtlHours` | Auto-refresh TTL (top-level). When a gateway's cached catalog is older than this, it is refreshed automatically — at pi load (all modes, including `pi --list-models` a[...]
 | `id` | Provider id (lowercase `[a-z0-9._-]`). Doubles as the `/login` credential key. |
 | `name` | Display name. |
 | `baseUrl` | Gateway base URL (no trailing slash). |
 | `api` | `openai-completions` (default), `openai-responses`, or `anthropic-messages`. A trailing `/v1` is stripped for anthropic. |
 | `apiKeyEnv` | Optional env var holding the API key (used for discovery; the stored `/login` credential wins at request time). |
-| `compat` | Per-gateway compat overrides merged into every discovered model (e.g. `{ "supportsStore": false }` for gateways fronting the strict Mistral API, which rejects pi's `store` parameter). |
-| `modelOverrides` | Per-model overrides keyed by model id (topmost layer): `api` (route to a different protocol, e.g. `openai-responses`), `reasoning`, `contextWindow`, `maxTokens`, `thinkingLevelMap` (null marks a level unsupported), `compat`. Manageable via the `gateways` tool (`action: "override"`) or `/gw override <id> <model> [k=v ...]`. |
+| `compat` | Per-gateway compat overrides merged into every discovered model (e.g. `{ "supportsStore": false }` for gateways fronting the strict Mistral API, which rejects pi's `store` parameter)[...]
+| `modelOverrides` | Per-model overrides keyed by model id (topmost layer): `api` (route to a different protocol, e.g. `openai-responses`), `reasoning`, `contextWindow`, `maxTokens`, `thinkingLev[...]
 | `excludedModels` | Model ids to never register. |
 
 ## Output-token capping
