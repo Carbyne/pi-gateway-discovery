@@ -67,6 +67,9 @@ import {
 } from "./autorefresh.ts";
 import { readSettingsDefault } from "./config.ts";
 import { discoverGateway } from "./discovery.ts";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
+import { chmod, rename, rm } from "node:fs/promises";
 
 // ---------------------------------------------------------------------------
 // Runtime state
@@ -323,16 +326,25 @@ async function addGateway(
 
   // If an API token was provided, store it in auth.json
   if (params.apiToken?.trim()) {
-    const auth = await (async () => {
-      try {
-        const content = await Deno.readTextFile(AUTH_PATH);
-        return JSON.parse(content) as Record<string, unknown>;
-      } catch {
-        return {};
-      }
-    })();
-    auth[id] = { type: "api_key", key: params.apiToken.trim() };
-    await Deno.writeTextFile(AUTH_PATH, JSON.stringify(auth, null, 2));
+    const tempPath = `${AUTH_PATH}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      await mkdir(dirname(AUTH_PATH), { recursive: true });
+      const auth = await (async () => {
+        try {
+          const content = await readFile(AUTH_PATH, "utf8");
+          return JSON.parse(content) as Record<string, unknown>;
+        } catch {
+          return {};
+        }
+      })();
+      auth[id] = { type: "api_key", key: params.apiToken.trim() };
+      await writeFile(tempPath, `${JSON.stringify(auth, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(tempPath, AUTH_PATH);
+      await chmod(AUTH_PATH, 0o600);
+    } catch (error) {
+      await rm(tempPath, { force: true });
+      throw error;
+    }
   }
 
   return {
