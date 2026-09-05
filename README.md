@@ -117,7 +117,8 @@ answers as the inference base.
       "modelOverrides": {
         "gpt-4o": { "api": "openai-responses" }
       },
-      "excludedModels": ["some/model"]
+      "excludedModels": ["some/model"],
+      "directHttpStreaming": true
     }
   ]
 }
@@ -134,6 +135,33 @@ answers as the inference base.
 | `compat` | Per-gateway compat overrides merged into every discovered model (e.g. `{ "supportsStore": false }` for gateways fronting the strict Mistral API, which rejects pi's `store` parameter)[...]
 | `modelOverrides` | Per-model overrides keyed by model id (topmost layer): `api` (route to a different protocol, e.g. `openai-responses`), `reasoning`, `contextWindow`, `maxTokens`, `thinkingLev[...]
 | `excludedModels` | Model ids to never register. |
+| `directHttpStreaming` | Route streaming inference requests through a `node:http`/`node:https`-backed fetch instead of the built-in `fetch` (undici). For gateways that only negotiate HTTP/1.1 — see “HTTP/1.1 streaming” below. |
+
+## HTTP/1.1 streaming (`directHttpStreaming`)
+
+Symptom: the gateway emits SSE events token-by-token (verify with `curl -N`),
+but pi shows the whole answer at once when generation ends. Cause: the
+gateway negotiates HTTP/1.1 only (no h2 ALPN), and Node's built-in fetch
+(undici) buffers the entire chunked HTTP/1.1 response before handing the body
+to the SSE consumer — every token delta then arrives as one lump.
+
+With `"directHttpStreaming": true` on the gateway, the extension injects an
+alternative fetch (built directly on `node:http`/`node:https`, which surface
+each network chunk immediately via `IncomingMessage`) into the provider SDK
+clients for that gateway's `stream` / `streamSimple` / `fetchDeferred` /
+`cancelDeferred` request paths. Discovery GETs keep the global fetch (their
+responses are small and fully read anyway).
+
+Enable it per gateway:
+
+- `/gw add <baseUrl> <id> direct=true`
+- the `gateways` tool: `action: "add"` with `directHttpStreaming: true`
+- or set the field in the config file and run `/reload`
+
+Caveats: proxy environment variables are **not** applied on this path (it is
+for direct gateways), and keep-alive sockets are pooled per process. If the
+gateway can serve HTTP/2, prefer fixing the ALPN — the built-in fetch streams
+correctly there.
 
 ## Output-token capping
 

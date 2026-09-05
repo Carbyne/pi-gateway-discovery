@@ -25,8 +25,10 @@ import {
   StringEnum,
   Type,
   type Api,
+  type FetchFunction,
   type Model,
   type Provider,
+  type ProviderStreams,
 } from "@earendil-works/pi-ai";
 import {
   anthropicMessagesApi,
@@ -70,6 +72,7 @@ import { discoverGateway } from "./discovery.ts";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { chmod, rename, rm } from "node:fs/promises";
+import { nodeHttpFetch } from "./streaming-fetch.ts";
 
 // ---------------------------------------------------------------------------
 // Runtime state
@@ -93,6 +96,10 @@ interface SyncInfo {
 let configFile: GatewayConfigFile = { version: 1, gateways: [] };
 const lastSync = new Map<string, SyncInfo>();
 
+function wrapStreams(gateway: GatewayConfig, streams: ProviderStreams): ProviderStreams {
+  return gateway.directHttpStreaming ? withDirectStreamingFetch(streams) : streams;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -109,6 +116,36 @@ function ageMs(timestamp: number): string {
 // ---------------------------------------------------------------------------
 // Provider construction
 // ---------------------------------------------------------------------------
+
+/**
+ * Wrap a ProviderStreams implementation so every request path that threads
+ * a custom fetch through (stream / streamSimple / fetchDeferred /
+ * cancelDeferred) uses the node:http-backed streaming fetch. Used for
+ * gateways with `directHttpStreaming: true` (HTTP/1.1-only gateways where
+ * undici buffers the whole chunked response — see streaming-fetch.ts).
+ * An explicitly passed fetch (should one ever exist) is preserved.
+ */
+function withDirectStreamingFetch(streams: ProviderStreams): ProviderStreams {
+  const inject = <T extends object | undefined>(
+    options: T,
+  ): T & { fetch?: FetchFunction } => ({
+    ...(options ?? {}),
+    fetch: (options as { fetch?: FetchFunction } | undefined)?.fetch ?? nodeHttpFetch,
+  }) as T & { fetch?: FetchFunction };
+  const wrapped: ProviderStreams = {
+    stream: (model, context, options) => streams.stream(model, context, inject(options)),
+    streamSimple: (model, context, options) => streams.streamSimple(model, context, inject(options)),
+  };
+  if (streams.fetchDeferred) {
+    wrapped.fetchDeferred = (model, handle, options) =>
+      streams.fetchDeferred!(model, handle, inject(options));
+  }
+  if (streams.cancelDeferred) {
+    wrapped.cancelDeferred = async (model, handle, options) =>
+      streams.cancelDeferred!(model, handle, inject(options));
+  }
+  return wrapped;
+}
 
 function makeProvider(gateway: GatewayConfig): Provider<Api> {
   const api: GatewayApi = gateway.api ?? "openai-completions";
@@ -159,9 +196,9 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
     },
     models: [],
     api: {
-      "openai-completions": openAICompletionsApi(),
-      "openai-responses": openAIResponsesApi(),
-      "anthropic-messages": anthropicMessagesApi(),
+      "openai-completions": wrapStreams(gateway, openAICompletionsApi()),
+      "openai-responses": wrapStreams(gateway, openAIResponsesApi()),
+      "anthropic-messages": wrapStreams(gateway, anthropicMessagesApi()),
     },
     fetchModels: async (context) => {
       if (!context.allowNetwork) return [];
@@ -292,7 +329,7 @@ async function cleanupGatewayState(
 
 async function addGateway(
   pi: ExtensionAPI,
-  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; apiToken?: string; compat?: Record<string, unknown> },
+  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; apiToken?: string; compat?: Record<string, unknown>; directHttpStreaming?: boolean },
   ctx: Pick<ExtensionCommandContext, "modelRegistry">,
 ): Promise<Record<string, unknown>> {
   if (!params.baseUrl) throw new Error("baseUrl is required for action=add");
@@ -321,6 +358,9 @@ async function addGateway(
         : {}),
     ...(managed?.modelOverrides ? { modelOverrides: managed.modelOverrides } : {}),
     ...(managed?.excludedModels ? { excludedModels: managed.excludedModels } : {}),
+    ...(params.directHttpStreaming ?? managed?.directHttpStreaming
+      ? { directHttpStreaming: true }
+      : {}),
   };
   await saveAndRegister(pi, gateway, ctx);
 
@@ -493,6 +533,7 @@ function listGateways(ctx: Pick<ExtensionCommandContext, "modelRegistry">): Reco
       baseUrl: gateway.baseUrl,
       api: gateway.api ?? "openai-completions",
       keySource: gateway.apiKeyEnv ? `env:${gateway.apiKeyEnv}` : "login",
+      ...(gateway.directHttpStreaming ? { directHttpStreaming: true } : {}),
       shadowsBuiltinProvider: builtIn.has(gateway.id),
       sync: summarizeSync(gateway.id),
     })),
@@ -648,7 +689,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // -------------------------------------------------------------------------
 
   pi.registerCommand("gw", {
-    description: "Gateway model discovery: /gw add <url> [id] [token] | remove <id> | sync [id] | list | override <id> <model> [k=v ...]",
+    description: "Gateway model discovery: /gw add <url> [id] [token] [direct=true] | remove <id> | sync [id] | list | override <id> <model> [k=v ...]",
     getArgumentCompletions: (prefix) => {
       const subcommands = ["add", "remove", "sync", "list", "override"].filter((c) => c.startsWith(prefix));
       if (subcommands.length > 0) return subcommands.map((value) => ({ value, label: value }));
@@ -678,7 +719,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           break;
         default:
           ctx.ui.notify(
-            "Usage: /gw add <baseUrl> [id] [token] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
+            "Usage: /gw add <baseUrl> [id] [token] [direct=true] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
             "warning",
           );
       }
@@ -759,7 +800,17 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       ctx.ui.notify("/gw add requires interactive or RPC UI mode (or use the gateways tool)", "error");
       return;
     }
-    const [rawUrl, rawId, rawToken] = args.trim().split(/\s+/u);
+    const [rawUrl, rawId, ...rest] = args.trim().split(/\s+/u);
+    // The first non-flag token is the API token; direct=… tokens are flags.
+    const rawToken = rest.find((t) => !t.startsWith("direct"));
+    let directHttpStreaming: boolean | undefined;
+    for (const token of rest) {
+      if (token === "direct=true" || token === "directStreaming=true") directHttpStreaming = true;
+      else if (token === "direct=false" || token === "directStreaming=false") directHttpStreaming = false;
+      else if (token !== rawToken) {
+        ctx.ui.notify(`Ignoring unknown flag: ${token} (supported: direct=true|false)`, "warning");
+      }
+    }
 
     let baseUrl = rawUrl;
     if (!baseUrl) {
@@ -785,7 +836,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     }
 
     try {
-      const result = await addGateway(pi, { baseUrl, gatewayId: id, apiToken: token }, ctx);
+      const result = await addGateway(pi, { baseUrl, gatewayId: id, apiToken: token, directHttpStreaming }, ctx);
       const gateway = result.gateway as GatewayConfig;
       if (token) {
         ctx.ui.notify(`Registered gateway '${gateway.id}' (${gateway.name}). API key stored.`, "info");
@@ -883,7 +934,8 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           : sync.state === "error"
             ? `error: ${sync.error}`
             : `not synced — ${sync.hint}`;
-      return `${gateway.id} (${gateway.api ?? "openai-completions"}) ${gateway.baseUrl}\n  ${syncText}`;
+      const flags = gateway.directHttpStreaming ? " [direct-http-streaming]" : "";
+      return `${gateway.id} (${gateway.api ?? "openai-completions"}) ${gateway.baseUrl}${flags}\n  ${syncText}`;
     });
     ctx.ui.notify(lines.join("\n"), "info");
   }
@@ -896,7 +948,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     name: "gateways",
     label: "Gateway Models",
     description:
-      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway, remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides, or inspect gateway status.",
+      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway (optionally with directHttpStreaming for HTTP/1.1-only gateways whose chunked SSE responses the built-in undici fetch buffers), remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides, or inspect gateway status.",
     promptSnippet: "Add, remove, sync, override, or inspect model-discovery gateways",
     parameters: Type.Object({
       action: StringEnum(["add", "remove", "sync", "list", "override"] as const),
@@ -905,6 +957,9 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       displayName: Type.Optional(Type.String({ description: "Display name for action=add" })),
       apiKeyEnv: Type.Optional(Type.String({ description: "Env var name holding the API key (alternative to /login)" })),
       apiToken: Type.Optional(Type.String({ description: "API token to store immediately (optional, can use /login later)" })),
+      directHttpStreaming: Type.Optional(
+        Type.Boolean({ description: "Route streaming inference through a node:http-based fetch instead of undici (action=add; for HTTP/1.1-only gateways whose chunked SSE responses undici buffers until completion)" }),
+      ),
       compat: Type.Optional(
         Type.Record(Type.String(), Type.Unknown(), { description: "Gateway-level compat overrides (action=add) or merged into the model override (action=override)" }),
       ),

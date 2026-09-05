@@ -49,6 +49,16 @@ export interface GatewayConfig {
   modelOverrides?: Record<string, ModelOverride>;
   /** Model ids to never register. */
   excludedModels?: string[];
+  /**
+   * Route streaming inference requests through a node:http/https-backed
+   * fetch instead of the global (undici) fetch. Set this for gateways that
+   * only negotiate HTTP/1.1: undici can buffer the entire chunked response
+   * there, so SSE token deltas arrive as one lump at the end of generation.
+   * Node's core http client surfaces each network chunk immediately.
+   * Proxy environment variables are not applied on this path (direct
+   * gateways only). Discovery GETs always keep the global fetch.
+   */
+  directHttpStreaming?: boolean;
 }
 
 export interface GatewayConfigFile {
@@ -236,6 +246,7 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
         : {}),
       ...(parseModelOverrides(item.modelOverrides) ? { modelOverrides: parseModelOverrides(item.modelOverrides) } : {}),
       ...(excludedModels && excludedModels.length > 0 ? { excludedModels } : {}),
+      ...(typeof item.directHttpStreaming === "boolean" && item.directHttpStreaming ? { directHttpStreaming: true } : {}),
     };
   });
 
