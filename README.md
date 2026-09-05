@@ -154,7 +154,7 @@ responses are small and fully read anyway).
 
 Enable it per gateway:
 
-- `/gw add <baseUrl> <id> direct=true`
+- `/gw add <baseUrl> <id> [token] [direct=true]`
 - the `gateways` tool: `action: "add"` with `directHttpStreaming: true`
 - or set the field in the config file and run `/reload`
 
