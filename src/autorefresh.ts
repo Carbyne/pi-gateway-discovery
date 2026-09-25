@@ -148,6 +148,11 @@ export interface AutoRefreshOutcome {
  */
 export async function refreshStaleGateways(
   config: GatewayConfigFile,
+  // Awaitable: the caller in index.ts persists discovery metadata here, and a
+  // callback that is fire-and-forget leaves that write racing process exit.
+  // `pi --list-models` prints and exits immediately, so an unawaited callback
+  // silently abandoned the write — observed as one missing lane plus a stray
+  // `.tmp` file in the agent dir.
   onResult?: (
     gatewayId: string,
     info: {
@@ -162,7 +167,7 @@ export async function refreshStaleGateways(
       status?: GatewayDiscoveryStatus;
       error?: string;
     },
-  ) => void,
+  ) => void | Promise<void>,
 ): Promise<AutoRefreshOutcome> {
   const outcome: AutoRefreshOutcome = { refreshed: [], skipped: [], failed: [] };
   const stale = staleGatewayIds(config, ttlMsFromConfig(config));
@@ -176,14 +181,14 @@ export async function refreshStaleGateways(
       const key = resolveGatewayKey(gateway);
       if (!key) {
         outcome.skipped.push({ id, reason: "no API key (run /login " + id + ")" });
-        onResult?.(id, { ok: false, error: "auto-refresh skipped: no API key" });
+        await onResult?.(id, { ok: false, error: "auto-refresh skipped: no API key" });
         return;
       }
       try {
         const discovered = await discoverGateway(gateway, key, signal);
         writeStoreEntry(id, discovered.models);
         outcome.refreshed.push(id);
-        onResult?.(id, {
+        await onResult?.(id, {
           ok: true,
           modelCount: discovered.models.length,
           matchedCount: discovered.status.matched.length,
@@ -198,7 +203,7 @@ export async function refreshStaleGateways(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         outcome.failed.push({ id, error: message });
-        onResult?.(id, { ok: false, error: `auto-refresh failed: ${message}` });
+        await onResult?.(id, { ok: false, error: `auto-refresh failed: ${message}` });
       }
     }),
   );

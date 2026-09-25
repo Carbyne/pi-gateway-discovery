@@ -330,6 +330,36 @@ console.log("concurrent persistence (race regression)");
   sandbox.dispose();
 }
 
+console.log("source guards (silent-failure classes)");
+
+// TypeScript accepts `() => void | Promise<void>` being passed an async
+// function and silently drops the promise, so an unawaited callback looks
+// exactly like working code. This bit twice in this repo: metadata writes that
+// raced process exit, losing a lane and leaving a stray temp file.
+{
+  const src = readFileSync(new URL("../src/autorefresh.ts", import.meta.url), "utf8");
+  const calls = [...src.matchAll(/^\s*(?:(await)\s+)?onResult\?\.\(/gmu)];
+  test("every onResult call is awaited (no dangling metadata writes)", () => {
+    const unawaited = calls.filter((m) => m[1] !== "await").length;
+    assert.equal(unawaited, 0, `${unawaited} of ${calls.length} onResult calls are not awaited`);
+  });
+  test("onResult is typed awaitable, not () => void", () => {
+    assert.match(src, /\)\s*=>\s*void \| Promise<void>/u);
+  });
+
+  // The unsafe temp-name pattern is what produced the original ENOENT storm.
+  const files = ["../src/config.ts", "../src/autorefresh.ts", "../src/index.ts"];
+  test("no `${pid}.${Date.now()}` temp paths remain", () => {
+    for (const f of files) {
+      const text = readFileSync(new URL(f, import.meta.url), "utf8");
+      assert.ok(!/process\.pid\}\.<\$\{|\$\{process\.pid\}\.\$\{Date\.now\(\)\}/u.test(text),
+        `unsafe temp path in ${f}`);
+      assert.ok(!/`\$\{[A-Z_]+PATH\}\.` \+ /.test(text) || !/Date\.now\(\)\.tmp/.test(text),
+        `unsafe temp path in ${f}`);
+    }
+  });
+}
+
 // --- report ---------------------------------------------------------------
 await runTests();
 console.log(`\n${passed} passed, ${failures.length} failed`);
