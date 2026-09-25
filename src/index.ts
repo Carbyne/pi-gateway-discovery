@@ -90,6 +90,9 @@ interface SyncInfo {
   unhealthyEndpoints?: number;
   litellmEnriched?: boolean;
   maxTokensCappedCount?: number;
+  /** Protocol actually used, and whether config or negotiation chose it. */
+  api?: GatewayApi;
+  apiSource?: "explicit" | "negotiated";
   error?: string;
 }
 
@@ -245,6 +248,8 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
           healthyEndpoints: result.status.healthyEndpoints,
           unhealthyEndpoints: result.status.unhealthyEndpoints,
           litellmEnriched: result.status.litellmEnriched,
+          api: result.status.api,
+          apiSource: result.status.apiSource,
           ...(result.status.maxTokensCapped
             ? { maxTokensCappedCount: result.status.maxTokensCapped.length }
             : {}),
@@ -454,6 +459,7 @@ function summarizeSync(id: string): Record<string, unknown> {
     matched: info.matchedCount,
     unmatched: info.unmatchedCount ?? info.unmatched?.length ?? 0,
     litellmEnriched: info.litellmEnriched,
+    ...(info.api ? { api: info.api, apiSource: info.apiSource } : {}),
     ...(info.maxTokensCappedCount ? { maxTokensCapped: info.maxTokensCappedCount } : {}),
     ...(info.healthyEndpoints !== undefined
       ? { healthyEndpoints: info.healthyEndpoints, unhealthyEndpoints: info.unhealthyEndpoints ?? 0 }
@@ -935,7 +941,12 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
             ? `error: ${sync.error}`
             : `not synced — ${sync.hint}`;
       const flags = gateway.directHttpStreaming ? " [direct-http-streaming]" : "";
-      return `${gateway.id} (${gateway.api ?? "openai-completions"}) ${gateway.baseUrl}${flags}\n  ${syncText}`;
+      // Show the protocol in use, not the one written in config: when `api` is
+      // omitted it is negotiated at discovery time, and "did my setting take
+      // effect?" is the question /gw list is being asked.
+      const effectiveApi = (sync.api ?? gateway.api ?? "openai-completions") as string;
+      const apiLabel = sync.api && sync.apiSource === "negotiated" ? `${effectiveApi} (negotiated)` : effectiveApi;
+      return `${gateway.id} (${apiLabel}) ${gateway.baseUrl}${flags}\n  ${syncText}`;
     });
     ctx.ui.notify(lines.join("\n"), "info");
   }

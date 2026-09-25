@@ -50,6 +50,15 @@ export interface GatewayConfig {
   /** Model ids to never register. */
   excludedModels?: string[];
   /**
+   * Drop models that can never serve a chat/completions request — realtime,
+   * audio/transcription, completions-only base models, and families without
+   * function calling. Default: true, because such an entry is dead weight in
+   * the `/model` picker that only fails on first use. Set false to keep every
+   * id the gateway lists (e.g. a gateway that reuses one of those words for a
+   * genuine chat model).
+   */
+  excludeUnusable?: boolean;
+  /**
    * Route streaming inference requests through a node:http/https-backed
    * fetch instead of the global (undici) fetch. Set this for gateways that
    * only negotiate HTTP/1.1: undici can buffer the entire chunked response
@@ -246,6 +255,8 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
         : {}),
       ...(parseModelOverrides(item.modelOverrides) ? { modelOverrides: parseModelOverrides(item.modelOverrides) } : {}),
       ...(excludedModels && excludedModels.length > 0 ? { excludedModels } : {}),
+      // Preserve an explicit false: the effective default is true.
+      ...(item.excludeUnusable === false ? { excludeUnusable: false } : {}),
       ...(typeof item.directHttpStreaming === "boolean" && item.directHttpStreaming ? { directHttpStreaming: true } : {}),
     };
   });
