@@ -15,6 +15,7 @@
  */
 import assert from "node:assert/strict";
 import { join } from "node:path";
+const repoRoot = new URL("..", import.meta.url).pathname;
 import { readdirSync, readFileSync } from "node:fs";
 import {
   declaredThinkingLevelMap,
@@ -415,6 +416,30 @@ console.log("google native metadata");
     assert.equal(idx.get("gemma-4-31b-it").thinking, true);
     assert.equal(idx.get("no-prefix-entry").inputTokenLimit, 5);
     assert.equal(idx.size, 2);
+  });
+}
+
+console.log("sweep cost guard");
+
+{
+  const { spawnSync } = await import("node:child_process");
+  const store = new URL("../src/quirks.ts", import.meta.url); // unused, keeps shape simple
+  const fixture = process.env.SWEEP_FIXTURE;
+
+  test("sweep refuses to spend without --yes-spend", () => {
+    if (!fixture) return; // needs a real catalog; skipped unless provided
+    const r = spawnSync(process.execPath,
+      ["--experimental-strip-types", "scripts/sweep.mjs", fixture, "--only", "no-such-model-xyz"],
+      { cwd: repoRoot, encoding: "utf8" });
+    assert.equal(r.status, 1, `expected a clean no-match exit; got ${r.status}: ${r.stderr?.slice(0,120)}`);
+  });
+
+  test("guard text and flags are wired to the parser (a typo here re-enables free spending)", () => {
+    const src = readFileSync(new URL("../scripts/sweep.mjs", import.meta.url), "utf8");
+    assert.match(src, /BOOLEAN_FLAGS = new Set\(\[.*"yes-spend"/u, "--yes-spend must be a declared boolean flag");
+    assert.match(src, /opt\("yes-spend", false\) !== true/u, "guard must read parsed opts, not raw argv");
+    assert.ok(!/argv\.push\(/u.test(src), "must not mutate argv while iterating it");
+    assert.match(src, /TRANSIENT = new Set\(\[.*429/u, "429 must be treated as transient");
   });
 }
 

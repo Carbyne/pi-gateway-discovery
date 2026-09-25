@@ -20,7 +20,9 @@ import { readFileSync } from "node:fs";
 
 // --- args ------------------------------------------------------------------
 const argv = process.argv.slice(2);
-const FLAGS = new Set(["store", "key", "key-from", "concurrency"]);
+const FLAGS = new Set(["store", "key", "key-from", "concurrency", "only", "levels"]);
+// Boolean switches: accepted with no value, tested via argv.includes().
+const BOOLEAN_FLAGS = new Set(["yes-spend", "include-expensive", "list-levels"]);
 
 const opts = {};
 const positional = [];
@@ -29,6 +31,7 @@ for (let i = 0; i < argv.length; i++) {
   if (token.startsWith("--")) {
     const name = token.slice(2);
     if (FLAGS.has(name)) { opts[name] = argv[++i]; continue; }
+    if (BOOLEAN_FLAGS.has(name)) { opts[name] = true; continue; }
     if (name.startsWith("no-")) { opts[name] = true; continue; }
     console.error(`unknown flag: ${token}`);
     process.exit(2);
@@ -51,6 +54,12 @@ const opt = (name, dflt) => (opts[name] !== undefined ? opts[name] : dflt);
  * prove the backend accepts the payload.
  * ----------------------------------------------------------------------- */
 const EXPENSIVE = /(-pro$|^o[134]-pro|gpt-5-[0-9]+-pro|^gpt-5-pro|realtime|deep-research)/iu;
+
+/**
+ * `--only <pattern>` / `--levels <a,b,c>` exist so a spot check costs a couple
+ * of requests instead of hundreds. Without them the only option is the full
+ * matrix, which turns "is this one model OK?" into a real bill.
+ */
 
 const STORE = positional[0] ?? opt("store", ".dev/agent/models-store.json");
 const KEY = opt("key", process.env.GATEWAY_API_KEY ?? process.env.PI_GATEWAY_API_KEY);
@@ -211,11 +220,28 @@ function limiter(max) {
 
 // --- main ------------------------------------------------------------------
 const store = JSON.parse(readFileSync(STORE, "utf8"));
-const models = Object.entries(store).flatMap(([gw, blob]) => (blob.models ?? []).map((m) => ({ ...m, provider: m.provider ?? gw })));
-const jobs = models.flatMap((m) => (m.reasoning ? LEVELS : ["off"]).map((lv) => [m, lv]));
+let models = Object.entries(store).flatMap(([gw, blob]) => (blob.models ?? []).map((m) => ({ ...m, provider: m.provider ?? gw })));
+
+const only = opt("only", undefined);
+if (only) {
+  const re = new RegExp(only, "iu");
+  models = models.filter((m) => re.test(m.id) || re.test(`${m.provider}/${m.id}`));
+  if (models.length === 0) { console.log(`no models match --only ${only}`); process.exit(1); }
+}
+
+const levelArg = opt("levels", undefined);
+const ACTIVE_LEVELS = levelArg ? levelArg.split(",").map((l) => l.trim()).filter(Boolean) : LEVELS;
+for (const l of ACTIVE_LEVELS) {
+  if (!LEVELS.includes(l) && l !== "minimal") {
+    console.log(`unknown thinking level '${l}' (valid: ${LEVELS.join(", ")}, minimal)`);
+    process.exit(1);
+  }
+}
+if (opt("list-levels")) { console.log(LEVELS.join(", ")); process.exit(0); }
+const jobs = models.flatMap((m) => (m.reasoning ? ACTIVE_LEVELS : ["off"]).map((lv) => [m, lv]));
 
 const expensive = models.filter((m) => EXPENSIVE.test(m.id));
-const includeExpensive = argv.includes("--include-expensive");
+const includeExpensive = opt("include-expensive", false) === true;
 if (!includeExpensive) {
   for (const m of expensive) {
     const idx = models.indexOf(m);
@@ -223,10 +249,10 @@ if (!includeExpensive) {
   }
 }
 
-const planned = models.flatMap((m) => (m.reasoning ? LEVELS : ["off"])).length;
-console.log(`\nSweep: ${models.length} models across ${Object.keys(store).length} gateways = ${planned} REAL completions`);
+const planned = models.flatMap((m) => (m.reasoning ? ACTIVE_LEVELS : ["off"])).length;
+console.log(`\nSweep: ${models.length} models (${only ? `--only ${only}` : "all"}) levels=[${ACTIVE_LEVELS.join(",")}] = ${planned} REAL completions`);
 console.log(`  expensive tiers skipped: ${expensive.length}${includeExpensive ? " (INCLUDED via --include-expensive)" : " (default)"}${expensive.length && !includeExpensive ? `\n    ${expensive.slice(0, 8).map((m) => `${m.provider}/${m.id}`).join(", ")}${expensive.length > 8 ? " …" : ""}` : ""}`);
-if (!argv.includes("--yes-spend")) {
+if (opt("yes-spend", false) !== true) {
   console.log("\nABORT: each probe bills real tokens. Re-run with --yes-spend to proceed.");
   process.exit(2);
 }
