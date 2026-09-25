@@ -20,7 +20,7 @@ import {
   retiredModelReason,
   unusableModelReason,
 } from "../src/quirks.ts";
-import { diffGatewayConfigs, fingerprintConfig } from "../src/config.ts";
+import { diffGatewayConfigs, fingerprintConfig, mergeGatewayConfigs, parseGatewayConfig } from "../src/config.ts";
 
 let passed = 0;
 const failures = [];
@@ -196,6 +196,56 @@ test("fingerprint ignores key order but not content", () => {
 
 test("diffing is insensitive to gateway order (reordering causes no re-registration)", () => {
   assert.equal(diffGatewayConfigs(cfg([gw("a"), gw("b")]), cfg([gw("b"), gw("a")])).changed, false);
+});
+
+console.log("portable bundles (export / import)");
+
+const gcfg = (id, extra = {}) => ({ id, name: "X", baseUrl: `https://e/${id}`, ...extra });
+
+test("merge upserts by id and keeps gateways the bundle does not mention", () => {
+  const current = cfg([gcfg("a"), gcfg("b")]);
+  const incoming = cfg([gcfg("b", { api: "anthropic-messages" }), gcfg("c")]);
+  const merged = mergeGatewayConfigs(current, incoming, "merge");
+  assert.deepEqual(merged.gateways.map((g) => g.id), ["a", "b", "c"]);
+  assert.equal(merged.gateways.find((g) => g.id === "b").api, "anthropic-messages");
+  assert.equal(merged.gateways.find((g) => g.id === "a").baseUrl, "https://e/a");
+});
+
+test("replace adopts the bundle verbatim, dropping local-only gateways", () => {
+  const merged = mergeGatewayConfigs(cfg([gcfg("a"), gcfg("b")]), cfg([gcfg("z")]), "replace");
+  assert.deepEqual(merged.gateways.map((g) => g.id), ["z"]);
+});
+
+test("merge takes the bundle's TTL when set, otherwise keeps the local one", () => {
+  assert.equal(mergeGatewayConfigs(cfg([gcfg("a")], 1), cfg([], 24), "merge").autoRefreshTtlHours, 24);
+  assert.equal(mergeGatewayConfigs(cfg([gcfg("a")], 1), cfg([]), "merge").autoRefreshTtlHours, 1);
+});
+
+test("an exported bundle round-trips through the loader's validator", () => {
+  const original = {
+    version: 1,
+    autoRefreshTtlHours: 24,
+    gateways: [
+      { id: "lane-a", name: "A", baseUrl: "https://e/a", api: "anthropic-messages", compat: { supportsStore: false } },
+      { id: "lane-b", name: "B", baseUrl: "https://e/b", modelOverrides: { "m1": { thinkingLevelMap: { low: null, high: "high" } } } },
+    ],
+  };
+  const bundle = { bundleVersion: 1, generatedBy: "pi-gateway-discovery", generatedAt: "x", config: original };
+  const parsed = parseGatewayConfig(bundle.config);
+  assert.equal(fingerprintConfig(parsed), fingerprintConfig(original));
+});
+
+test("the validator rejects a malformed bundle rather than half-loading it", () => {
+  assert.throws(() => parseGatewayConfig({ version: 2, gateways: [] }));
+  assert.throws(() => parseGatewayConfig({ version: 1, gateways: [{ id: "ok", name: "N" }] })); // no baseUrl
+  assert.throws(() => parseGatewayConfig({ version: 1, gateways: [{ id: "ok", name: "N", baseUrl: "ftp://x" }] }));
+  assert.throws(() =>
+    parseGatewayConfig({ version: 1, gateways: [{ id: "ok", name: "N", baseUrl: "https://e", api: "nonsense" }] }));
+});
+
+test("normalizeBaseUrl trims the trailing slash that would double up in paths", () => {
+  const parsed = parseGatewayConfig({ version: 1, gateways: [{ id: "g", name: "G", baseUrl: "https://e/v1/" }] });
+  assert.equal(parsed.gateways[0].baseUrl, "https://e/v1");
 });
 
 // --- report ---------------------------------------------------------------

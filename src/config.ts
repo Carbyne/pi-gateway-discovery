@@ -217,6 +217,15 @@ export function suggestGatewayIdentity(
 // Persistence (atomic, 0600)
 // ---------------------------------------------------------------------------
 
+/**
+ * Validate + normalize a parsed config object. Exported so import paths can
+ * reuse exactly the rules the on-disk file is held to, rather than inventing a
+ * second, laxer parser that lets a bad bundle reach the registry.
+ */
+export function parseGatewayConfig(value: unknown): GatewayConfigFile {
+  return parseConfigFile(value);
+}
+
 function parseConfigFile(value: unknown): GatewayConfigFile {
   if (!value || typeof value !== "object") throw new Error("Configuration must be a JSON object");
   const input = value as { version?: unknown; gateways?: unknown; autoRefreshTtlHours?: unknown };
@@ -338,6 +347,29 @@ export function diffGatewayConfigs(before: GatewayConfigFile, after: GatewayConf
     modified,
     ttlChanged,
     changed: added.length + removed.length + modified.length > 0 || ttlChanged,
+  };
+}
+
+/**
+ * Fold an imported set of gateways into the current config.
+ *
+ * `merge` upserts by gateway id and keeps everything the bundle does not
+ * mention; `replace` adopts the bundle verbatim. Pure, so the semantics that
+ * decide whether someone's tuned setup survives an import are testable without
+ * a running pi session.
+ */
+export function mergeGatewayConfigs(
+  current: GatewayConfigFile,
+  incoming: GatewayConfigFile,
+  mode: "merge" | "replace",
+): GatewayConfigFile {
+  if (mode === "replace") return incoming;
+  const byId = new Map(current.gateways.map((g) => [g.id, g]));
+  for (const gateway of incoming.gateways) byId.set(gateway.id, gateway);
+  return {
+    version: 1,
+    autoRefreshTtlHours: incoming.autoRefreshTtlHours ?? current.autoRefreshTtlHours,
+    gateways: [...byId.values()].sort((a, b) => a.id.localeCompare(b.id)),
   };
 }
 
