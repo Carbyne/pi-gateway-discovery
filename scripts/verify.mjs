@@ -37,9 +37,21 @@ check("R1 yoda-claude registered (discovery succeeded at all)", of("yoda-claude"
     `${of("yoda-claude").length - wrong.length}/${of("yoda-claude").length}`);
 }
 {
-  const wrong = of("yoda-openai").filter((m) => m.api !== "openai-completions");
-  check("R1 openai lane stays on openai-completions by default", wrong.length === 0,
-    `${wrong.length} unexpectedly switched`);
+  // Negotiation must not touch OpenAI-shaped lanes; only the quirk table may
+  // move individual models to /responses. So: models outside the
+  // responses-required families stay on openai-completions, and the ones inside
+  // them are switched. Both directions are asserted.
+  const responsesFamilies = /^gpt-5\.(3-codex|4|5|6)|^gpt-6|^o[13]-pro$|-pro(?:-20\d{2}-\d{2}-\d{2})?$/u;
+  const lane = of("yoda-openai");
+  const shouldStay = lane.filter((m) => !responsesFamilies.test(m.id));
+  const shouldSwitch = lane.filter((m) => responsesFamilies.test(m.id));
+  const wrongStay = shouldStay.filter((m) => m.api !== "openai-completions");
+  const wrongSwitch = shouldSwitch.filter((m) => m.api !== "openai-responses");
+  check("R1 non-responses families stay on openai-completions",
+    wrongStay.length === 0, `${shouldStay.length - wrongStay.length}/${shouldStay.length}`);
+  check("R1 -pro / gpt-5.4+ families routed to openai-responses",
+    shouldSwitch.length > 0 && wrongSwitch.length === 0,
+    `${shouldSwitch.length - wrongSwitch.length}/${shouldSwitch.length}`);
 }
 
 // --- R2: strict-by-default compat ----------------------------------------
