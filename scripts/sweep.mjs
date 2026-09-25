@@ -20,7 +20,9 @@ import { readFileSync } from "node:fs";
 
 // --- args ------------------------------------------------------------------
 const argv = process.argv.slice(2);
-const FLAGS = new Set(["store", "key", "key-from", "concurrency"]);
+const FLAGS = new Set(["store", "key", "key-from", "concurrency", "only", "levels"]);
+// Boolean switches: accepted with no value, tested via argv.includes().
+const BOOLEAN_FLAGS = new Set(["yes-spend", "include-expensive", "list-levels"]);
 
 const opts = {};
 const positional = [];
@@ -29,6 +31,7 @@ for (let i = 0; i < argv.length; i++) {
   if (token.startsWith("--")) {
     const name = token.slice(2);
     if (FLAGS.has(name)) { opts[name] = argv[++i]; continue; }
+    if (BOOLEAN_FLAGS.has(name)) { opts[name] = true; continue; }
     if (name.startsWith("no-")) { opts[name] = true; continue; }
     console.error(`unknown flag: ${token}`);
     process.exit(2);
@@ -36,6 +39,27 @@ for (let i = 0; i < argv.length; i++) {
   positional.push(token);
 }
 const opt = (name, dflt) => (opts[name] !== undefined ? opts[name] : dflt);
+
+/* -------------------------------------------------------------------------
+ * Cost guard.
+ *
+ * Every probe here is a REAL completion, and some registered models are
+ * expensive reasoning tiers billed per output token. A full sweep is therefore
+ * a spend of real money, not a free test, and must not run by accident.
+ *
+ * Default behaviour: refuse to run at all unless --yes-spend is given, and
+ * skip known-costly families even then unless --include-expensive. Prefer the
+ * free checks (`pi --list-models` for discovery, `verify.mjs` for effective
+ * config, `selftest.mjs` for logic) and reach for this only when you need to
+ * prove the backend accepts the payload.
+ * ----------------------------------------------------------------------- */
+const EXPENSIVE = /(-pro$|^o[134]-pro|gpt-5-[0-9]+-pro|^gpt-5-pro|realtime|deep-research)/iu;
+
+/**
+ * `--only <pattern>` / `--levels <a,b,c>` exist so a spot check costs a couple
+ * of requests instead of hundreds. Without them the only option is the full
+ * matrix, which turns "is this one model OK?" into a real bill.
+ */
 
 const STORE = positional[0] ?? opt("store", ".dev/agent/models-store.json");
 const KEY = opt("key", process.env.GATEWAY_API_KEY ?? process.env.PI_GATEWAY_API_KEY);
@@ -138,20 +162,51 @@ function extractError(text) {
   return text.slice(0, 200);
 }
 
+const TRANSIENT = new Set([408, 425, 429, 500, 502, 503, 504]);
+const PROBE_ATTEMPTS = 3;
+
+/**
+ * One (model, level) probe, retrying only genuinely transient outcomes.
+ *
+ * Without this the sweep misreports capacity throttling as a configuration
+ * defect: a `429 Not enough capacity` on a single level made a working model
+ * appear broken, and a diagnostic that lies gets ignored. 4xx responses are
+ * NOT retried — those are deterministic statements about the payload (bad
+ * parameter, retired model, org entitlement), and retrying them just wastes
+ * quota. `ERR` (timeout / connection reset) is retried, since that is what it
+ * usually is.
+ */
+async function probeOnce(model, level) {
+  const { url, headers, payload } = build(model, level);
+  try {
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(90_000) });
+    if (res.ok) return { ok: true };
+    const text = await res.text();
+    return { ok: false, status: res.status, detail: extractError(text) };
+  } catch (err) {
+    return { ok: false, status: "ERR", detail: String(err?.message ?? err) };
+  }
+}
+
 async function probe(model, level, limiter) {
   await limiter.acquire();
   try {
-    const { url, headers, payload } = build(model, level);
-    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(90_000) });
-    if (res.ok) return null;
-    const text = await res.text();
-    return { gw: model.provider, id: model.id, api: model.api, level, clamped: clamp(model, level), status: res.status, detail: extractError(text) };
-  } catch (err) {
-    return { gw: model.provider, id: model.id, api: model.api, level, clamped: "?", status: "ERR", detail: String(err?.message ?? err) };
+    let last;
+    for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+      last = await probeOnce(model, level);
+      if (last.ok) return attempt > 1 ? { retriedAndPassed: true } : null;
+      const status = last.status;
+      const transient = status === "ERR" || TRANSIENT.has(Number(status));
+      if (!transient) break;
+      if (attempt < PROBE_ATTEMPTS) await sleep(1500 * attempt);
+    }
+    return { gw: model.provider, id: model.id, api: model.api, level, clamped: clamp(model, level), status: last.status, detail: last.detail };
   } finally {
     limiter.release();
   }
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function limiter(max) {
   let active = 0;
@@ -165,15 +220,50 @@ function limiter(max) {
 
 // --- main ------------------------------------------------------------------
 const store = JSON.parse(readFileSync(STORE, "utf8"));
-const models = Object.entries(store).flatMap(([gw, blob]) => (blob.models ?? []).map((m) => ({ ...m, provider: m.provider ?? gw })));
-const jobs = models.flatMap((m) => (m.reasoning ? LEVELS : ["off"]).map((lv) => [m, lv]));
+let models = Object.entries(store).flatMap(([gw, blob]) => (blob.models ?? []).map((m) => ({ ...m, provider: m.provider ?? gw })));
 
-console.log(`\nSweeping ${models.length} models across ${Object.keys(store).length} gateways — ${jobs.length} probes\n`);
+const only = opt("only", undefined);
+if (only) {
+  const re = new RegExp(only, "iu");
+  models = models.filter((m) => re.test(m.id) || re.test(`${m.provider}/${m.id}`));
+  if (models.length === 0) { console.log(`no models match --only ${only}`); process.exit(1); }
+}
+
+const levelArg = opt("levels", undefined);
+const ACTIVE_LEVELS = levelArg ? levelArg.split(",").map((l) => l.trim()).filter(Boolean) : LEVELS;
+for (const l of ACTIVE_LEVELS) {
+  if (!LEVELS.includes(l) && l !== "minimal") {
+    console.log(`unknown thinking level '${l}' (valid: ${LEVELS.join(", ")}, minimal)`);
+    process.exit(1);
+  }
+}
+if (opt("list-levels")) { console.log(LEVELS.join(", ")); process.exit(0); }
+const jobs = models.flatMap((m) => (m.reasoning ? ACTIVE_LEVELS : ["off"]).map((lv) => [m, lv]));
+
+const expensive = models.filter((m) => EXPENSIVE.test(m.id));
+const includeExpensive = opt("include-expensive", false) === true;
+if (!includeExpensive) {
+  for (const m of expensive) {
+    const idx = models.indexOf(m);
+    if (idx >= 0) models.splice(idx, 1);
+  }
+}
+
+const planned = models.flatMap((m) => (m.reasoning ? ACTIVE_LEVELS : ["off"])).length;
+console.log(`\nSweep: ${models.length} models (${only ? `--only ${only}` : "all"}) levels=[${ACTIVE_LEVELS.join(",")}] = ${planned} REAL completions`);
+console.log(`  expensive tiers skipped: ${expensive.length}${includeExpensive ? " (INCLUDED via --include-expensive)" : " (default)"}${expensive.length && !includeExpensive ? `\n    ${expensive.slice(0, 8).map((m) => `${m.provider}/${m.id}`).join(", ")}${expensive.length > 8 ? " …" : ""}` : ""}`);
+if (opt("yes-spend", false) !== true) {
+  console.log("\nABORT: each probe bills real tokens. Re-run with --yes-spend to proceed.");
+  process.exit(2);
+}
 const lim = limiter(Number(opt("concurrency", 10)));
-const failures = (await Promise.all(jobs.map(([m, lv]) => probe(m, lv, lim)))).filter(Boolean);
+const results = await Promise.all(jobs.map(([m, lv]) => probe(m, lv, lim)));
+const failures = results.filter((r) => r && !r.retriedAndPassed);
+
+const retried = results.filter((r) => r && r.retriedAndPassed).length;
 
 const byModel = new Map();
-for (const f of failures) {
+for (const f of failures.filter(Boolean)) {
   if (!byModel.has(`${f.gw}/${f.id}`)) byModel.set(`${f.gw}/${f.id}`, []);
   byModel.get(`${f.gw}/${f.id}`).push(f);
 }
@@ -181,5 +271,14 @@ for (const [key, list] of byModel) {
   console.log(`FAIL ${key}  [${list[0].api}]`);
   for (const f of list) console.log(`       level=${f.level.padEnd(6)} clamped=${String(f.clamped).padEnd(6)} HTTP ${f.status}  ${f.detail.slice(0, 150)}`);
 }
-console.log(`\n${jobs.length - failures.length}/${jobs.length} probes OK, ${failures.length} failing, ${byModel.size} models affected`);
-process.exit(failures.length === 0 ? 0 : 1);
+const realFailures = failures.filter(Boolean);
+console.log(`\n${jobs.length - realFailures.length}/${jobs.length} probes OK, ${realFailures.length} failing, ${byModel.size} models affected`);
+if (retried > 0) {
+  console.log(`  note: ${retried} probe(s) initially failed transiently (429/5xx/network) and passed on retry — not counted as failures`);
+}
+if (realFailures.length) {
+  const byStatus = {};
+  for (const f of realFailures) byStatus[f.status] = (byStatus[f.status] ?? 0) + 1;
+  console.log(`  by status: ${Object.entries(byStatus).map(([k, v]) => `${k}=${v}`).join(", ")}`);
+}
+process.exit(realFailures.length === 0 ? 0 : 1);

@@ -213,27 +213,70 @@ first:
 `/gw describe <id> <model>` reports the resolved values **and** which layer
 supplied them.
 
+### Google native metadata
+
+The OpenAI-compatible shim Google exposes returns no per-model data at all —
+entries carry only `id`, `object`, `owned_by`, `display_name`. So any model pi's
+built-in catalog does not recognize falls through to the 32K/8K defaults, on
+lanes whose real windows are 1M/65K. When a lane looks like that shim (ids with
+the `models/` resource prefix) discovery also queries the sibling native list,
+which accepts the same key, and takes from it:
+
+- `inputTokenLimit` → context window (chosen over input+output totals: never
+  overstates the window, which is the direction that breaks compaction sizing)
+- `outputTokenLimit` → max output tokens
+- `thinking` → the reasoning flag
+- `supportedGenerationMethods` → a model exposing no `generateContent` is not a
+  chat model, whatever its id says
+
+Explicit `modelOverrides` still win, and the request is best-effort: an absent,
+slow, or differently-authenticated endpoint changes nothing.
+
+> [!WARNING]
+> Trusting `thinking` means pi will now send `reasoning_effort` to models it
+> previously treated as non-reasoning. That is correct for models that reason,
+> but a backend that advertises `thinking: true` while rejecting the effort
+> values would newly fail. If you hit that, pin the model with a
+> `thinkingLevelMap`, or set `googleNativeMetadata: false` to take the size
+> limits without the flag.
+
 ### Known limits of the quirk table
 
-The table is name-keyed, and that has two consequences worth stating rather
-than hiding:
+The table is name-keyed, and that has consequences worth stating rather than
+hiding:
 
-- **It trades precision for coverage.** A family prefix cannot express
-  sibling differences: on the deployment this table was built against,
-  `zai-glm-5`, `zai-glm-5-3` and `zai-glm-latest` accept `low|high|max`, while
-  `zai-glm-5-2` accepts every level. The rule gives 5-2 the restrictive map, so
-  a requested `medium` clamps to `high` — requests succeed, but not at the
-  chosen level. The fix is upstream declaration, not a per-model exception.
-- **It cannot know lifecycle facts.** A vendor retiring an id is invisible to a
-  name pattern. Where the list publishes `shutdown_date` these are filtered
-  correctly, but a backend whose `/models` carries no lifecycle field (the
-  Google OpenAI shim returns only `id`, `object`, `owned_by`, `display_name`)
-  will keep advertising retired models. Use `excludedModels` for those.
+- **Aliases make id-matching unsafe on its own.** Gateways routinely list one
+  model under several ids, all resolving to the same `name` — `glm-5-2` and
+  `zai-glm-5-2` are one checkpoint, as are `zai-glm-5`, `zai-glm-5-3` and
+  `zai-glm-latest`. Rules therefore match the resolved name as well as the id,
+  and a family prefix is narrowed where siblings genuinely differ: `glm-5-2`
+  accepts every effort level while the `zai-glm-5-3` family accepts only
+  `low|high|max`. Matching ids alone configured one backend two ways, with the
+  more restrictive side winning — a rule that disagrees with itself across
+  aliases is wrong regardless of which entry you measure.
+- **Coverage still beats precision.** Where a family rule cannot express a
+  sibling difference exactly it errs restrictive: a requested level clamps to
+  one the backend accepts, so requests succeed rather than 400. The permanent
+  fix is upstream declaration (`reasoning.supported_efforts`), which layer 2
+  already prefers over any name guess.
+- **It cannot know lifecycle facts.** Retirement is published under different
+  field names per vendor — `shutdown_date` (OpenAI-style), `deprecation` plus
+  `deprecation_replacement_model` (Mistral), `ttlExpirationTime` (Google) — and
+  all are read. A date in the future is a scheduled retirement, not a dead
+  model, so values are compared against now rather than tested for presence.
+  A vendor that says nothing is still invisible: Google's own native list
+  advertises `generateContent` for a model the API 404s as retired. Use
+  `excludedModels` for those. Note the asymmetry that makes this acceptable — a
+  wrongly excluded model is visible in `/gw list` and `/gw doctor` with its
+  reason and reversible via `excludeUnusable: false`, whereas a wrongly kept one
+  fails at request time with an opaque error.
 
-Both are why layer 2 (upstream-declared metadata) outranks layer 3, and why
-`modelOverrides` remains the escape hatch rather than a sign of failure. Unusable families (embeddings, realtime, audio,
-completions-only) are dropped during discovery and listed with their reason in
-`/gw list` output and `gateways` tool status.
+These are why layer 2 (upstream-declared metadata) outranks layer 3, and why
+`modelOverrides` remains the escape hatch rather than a sign of failure.
+
+Unusable families (embeddings, realtime, audio, completions-only) are dropped
+during discovery and listed with their reason in `/gw list` output and
+`gateways` tool status.
 
 ### Protocol negotiation
 

@@ -127,6 +127,18 @@ if (expectations) {
   }
 }
 
+// --- 3. alias consistency --------------------------------------------------
+// One model listed under several ids must be configured identically. A rule
+// keyed only on the id can disagree with itself across aliases, and the more
+// restrictive variant wins.
+for (const rule of expectations?.aliasConsistency ?? []) {
+  const ms = rule.ids.map((id) => of(rule.gateway).find((m) => m.id === id)).filter(Boolean);
+  if (ms.length < 2) continue;
+  const maps = new Set(ms.map((m) => JSON.stringify(m.thinkingLevelMap ?? null)));
+  check(`aliases agree: ${rule.gateway} ${rule.ids.join(" = ")}`, maps.size === 1,
+    maps.size === 1 ? `${ms.length}/${ms.length} identical` : [...maps].join(" vs ").slice(0, 120));
+}
+
 // --- report ---------------------------------------------------------------
 for (const p of pass) console.log(`  PASS  ${p}`);
 for (const f of fail) console.log(`  FAIL  ${f}`);
