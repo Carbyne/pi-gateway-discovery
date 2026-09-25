@@ -1,0 +1,56 @@
+{
+  "_comment": "Copy to .dev/agent/expectations.json (or pass --expectations) and edit for your gateway. Every field is optional; verify.mjs runs its universal invariants without this file.",
+  "lanes": {
+    "acme-claude": {
+      "api": "anthropic-messages",
+      "minModels": 1
+    },
+    "acme-openai": {
+      "api": "openai-completions"
+    }
+  },
+  "responsesFor": [
+    {
+      "gateway": "acme-openai",
+      "match": "^gpt-5\\.[4-9]"
+    },
+    {
+      "gateway": "acme-openai",
+      "match": "-pro$"
+    }
+  ],
+  "staysOnCompletions": [
+    {
+      "gateway": "acme-openai",
+      "match": "^gpt-4o$"
+    }
+  ],
+  "vocab": [
+    {
+      "gateway": "acme-mistral",
+      "match": "^mistral-(medium|small)",
+      "expect": {
+        "off": "none",
+        "minimal": null,
+        "low": null,
+        "medium": null,
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      }
+    },
+    {
+      "gateway": "acme-openai",
+      "match": "^o\\d[\\d.]*-pro$",
+      "expect": {
+        "off": null,
+        "minimal": null,
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "xhigh": null,
+        "max": null
+      }
+    }
+  ]
+}

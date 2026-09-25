@@ -138,8 +138,8 @@ const UNUSABLE_PATTERNS: Array<{ match: RegExp; reason: string }> = [
 /**
  * Ids a pattern should be tested against.
  *
- * Gateways routinely namespace model ids (`yoda/mistral-medium-3.5`,
- * `openai/gpt-5.5-pro`). A table anchored on the bare model name would
+ * Gateways routinely namespace model ids (`acme/mistral-medium-3.5`,
+ * `vendor/gpt-5.5-pro`). A table anchored on the bare model name would
  * silently never fire on those lanes — it looks like "no quirk applies" rather
  * than a matching bug — so every rule tests both the full id and the segment
  * after the last slash.

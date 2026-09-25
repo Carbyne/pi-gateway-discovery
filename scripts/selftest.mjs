@@ -34,7 +34,7 @@ console.log("\nquirk table");
 
 test("does not leak across vendors: gemini-2.5-pro stays on its lane protocol", () => {
   assert.equal(api("gemini-2.5-pro"), undefined);
-  assert.equal(api("yoda/gemini-2.5-pro"), undefined);
+  assert.equal(api("acme/gemini-2.5-pro"), undefined);
 });
 
 test("does not leak across vendors: mistral-medium-3-pro is not an OpenAI pro", () => {
@@ -81,8 +81,8 @@ test("gpt-5.4+/gpt-6 keep 'off' usable, because they accept an explicit none", (
 });
 
 test("rules fire through vendor id namespaces", () => {
-  assert.deepEqual(resolveQuirk("yoda/mistral-medium-3.5").thinkingLevelMap.low, null);
-  assert.deepEqual(resolveQuirk("openai/gpt-5.5-pro").api, "openai-responses");
+  assert.deepEqual(resolveQuirk("acme/mistral-medium-3.5").thinkingLevelMap.low, null);
+  assert.deepEqual(resolveQuirk("vendor/gpt-5.5-pro").api, "openai-responses");
 });
 
 test("mistral medium/small family speaks only none|high", () => {
@@ -126,7 +126,7 @@ test("does NOT exclude real chat models whose names merely look similar", () => 
 });
 
 test("excludes through a vendor namespace too", () => {
-  assert.ok(unusableModelReason("yoda/gpt-realtime-mini"));
+  assert.ok(unusableModelReason("acme/gpt-realtime-mini"));
 });
 
 test("retiredModelReason uses the date, not the presence of a date", () => {

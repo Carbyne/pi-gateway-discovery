@@ -13,7 +13,7 @@
  * clamping is untested and you get false failures for levels pi would never
  * send.
  *
- *   YODA_API_KEY=... node scripts/sweep.mjs [.dev/agent/models-store.json]
+ *   GATEWAY_API_KEY=... node scripts/sweep.mjs [models-store.json]
  *   node scripts/sweep.mjs --store path --key-from ~/.pi/agent/auth.json
  */
 import { readFileSync } from "node:fs";
@@ -38,7 +38,7 @@ for (let i = 0; i < argv.length; i++) {
 const opt = (name, dflt) => (opts[name] !== undefined ? opts[name] : dflt);
 
 const STORE = positional[0] ?? opt("store", ".dev/agent/models-store.json");
-const KEY = opt("key", process.env.YODA_API_KEY ?? process.env.GATEWAY_API_KEY);
+const KEY = opt("key", process.env.GATEWAY_API_KEY ?? process.env.PI_GATEWAY_API_KEY);
 const KEY_FROM = opt("key-from", undefined);
 
 function resolveKey(model) {
@@ -50,7 +50,7 @@ function resolveKey(model) {
     const any = Object.values(auth).find((v) => v?.key); // gateways often share one key
     if (any) return any.key;
   }
-  throw new Error(`no API key: set YODA_API_KEY or pass --key-from <auth.json>`);
+  throw new Error(`no API key: set GATEWAY_API_KEY or pass --key-from <auth.json>`);
 }
 
 // --- pi core parity --------------------------------------------------------

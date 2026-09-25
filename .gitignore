@@ -3,7 +3,15 @@ node_modules/
 *.tmp
 .DS_Store
 
-# local dev harness — never contains secrets (keys are read from the real
-# auth.json at launch and only placed in the environment)
+# Dev harness, local to a checkout.
+#   .dev/    sandbox PI_CODING_AGENT_DIR — fixtures + generated catalogs
+#   .tools/  dev-only toolchain (kept outside node_modules/ so npm cannot
+#            write through the dependency symlinks into an installed copy)
+# Neither holds secrets: keys are read from the real auth.json at launch and
+# only ever placed in the environment.
 .dev/
 .tools/
+
+# Deployment-coupled E2E harness: it names one company's gateway and asserts
+# against that deployment's fixtures, so it is not a general tool.
+scripts/local/
