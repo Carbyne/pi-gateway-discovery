@@ -33,16 +33,7 @@ fi
 # Supply the gateway key from the real credential store, without materialising
 # a second secret file. Override by exporting YODA_API_KEY yourself first.
 if [ -z "${YODA_API_KEY:-}" ] && [ -r "$REAL_AUTH" ]; then
-  YODA_API_KEY="$(python3 -c '
-import json,sys
-try:
-    d = json.load(open(sys.argv[1]))
-    for v in d.values():
-        k = v.get("key") if isinstance(v, dict) else None
-        if k:
-            print(k); break
-except Exception:
-    pass' "$REAL_AUTH")"
+  YODA_API_KEY="$("$HERE/scripts/read-yoda-key.sh" "$REAL_AUTH")"
   export YODA_API_KEY
   if [ -n "$YODA_API_KEY" ]; then
     echo "dev-pi: YODA_API_KEY loaded from $REAL_AUTH" >&2
