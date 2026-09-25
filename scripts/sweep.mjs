@@ -138,20 +138,51 @@ function extractError(text) {
   return text.slice(0, 200);
 }
 
+const TRANSIENT = new Set([408, 425, 429, 500, 502, 503, 504]);
+const PROBE_ATTEMPTS = 3;
+
+/**
+ * One (model, level) probe, retrying only genuinely transient outcomes.
+ *
+ * Without this the sweep misreports capacity throttling as a configuration
+ * defect: a `429 Not enough capacity` on a single level made a working model
+ * appear broken, and a diagnostic that lies gets ignored. 4xx responses are
+ * NOT retried — those are deterministic statements about the payload (bad
+ * parameter, retired model, org entitlement), and retrying them just wastes
+ * quota. `ERR` (timeout / connection reset) is retried, since that is what it
+ * usually is.
+ */
+async function probeOnce(model, level) {
+  const { url, headers, payload } = build(model, level);
+  try {
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(90_000) });
+    if (res.ok) return { ok: true };
+    const text = await res.text();
+    return { ok: false, status: res.status, detail: extractError(text) };
+  } catch (err) {
+    return { ok: false, status: "ERR", detail: String(err?.message ?? err) };
+  }
+}
+
 async function probe(model, level, limiter) {
   await limiter.acquire();
   try {
-    const { url, headers, payload } = build(model, level);
-    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(90_000) });
-    if (res.ok) return null;
-    const text = await res.text();
-    return { gw: model.provider, id: model.id, api: model.api, level, clamped: clamp(model, level), status: res.status, detail: extractError(text) };
-  } catch (err) {
-    return { gw: model.provider, id: model.id, api: model.api, level, clamped: "?", status: "ERR", detail: String(err?.message ?? err) };
+    let last;
+    for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+      last = await probeOnce(model, level);
+      if (last.ok) return attempt > 1 ? { retriedAndPassed: true } : null;
+      const status = last.status;
+      const transient = status === "ERR" || TRANSIENT.has(Number(status));
+      if (!transient) break;
+      if (attempt < PROBE_ATTEMPTS) await sleep(1500 * attempt);
+    }
+    return { gw: model.provider, id: model.id, api: model.api, level, clamped: clamp(model, level), status: last.status, detail: last.detail };
   } finally {
     limiter.release();
   }
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function limiter(max) {
   let active = 0;
@@ -170,10 +201,13 @@ const jobs = models.flatMap((m) => (m.reasoning ? LEVELS : ["off"]).map((lv) => 
 
 console.log(`\nSweeping ${models.length} models across ${Object.keys(store).length} gateways — ${jobs.length} probes\n`);
 const lim = limiter(Number(opt("concurrency", 10)));
-const failures = (await Promise.all(jobs.map(([m, lv]) => probe(m, lv, lim)))).filter(Boolean);
+const results = await Promise.all(jobs.map(([m, lv]) => probe(m, lv, lim)));
+const failures = results.filter((r) => r && !r.retriedAndPassed);
+
+const retried = results.filter((r) => r && r.retriedAndPassed).length;
 
 const byModel = new Map();
-for (const f of failures) {
+for (const f of failures.filter(Boolean)) {
   if (!byModel.has(`${f.gw}/${f.id}`)) byModel.set(`${f.gw}/${f.id}`, []);
   byModel.get(`${f.gw}/${f.id}`).push(f);
 }
@@ -181,5 +215,14 @@ for (const [key, list] of byModel) {
   console.log(`FAIL ${key}  [${list[0].api}]`);
   for (const f of list) console.log(`       level=${f.level.padEnd(6)} clamped=${String(f.clamped).padEnd(6)} HTTP ${f.status}  ${f.detail.slice(0, 150)}`);
 }
-console.log(`\n${jobs.length - failures.length}/${jobs.length} probes OK, ${failures.length} failing, ${byModel.size} models affected`);
-process.exit(failures.length === 0 ? 0 : 1);
+const realFailures = failures.filter(Boolean);
+console.log(`\n${jobs.length - realFailures.length}/${jobs.length} probes OK, ${realFailures.length} failing, ${byModel.size} models affected`);
+if (retried > 0) {
+  console.log(`  note: ${retried} probe(s) initially failed transiently (429/5xx/network) and passed on retry — not counted as failures`);
+}
+if (realFailures.length) {
+  const byStatus = {};
+  for (const f of realFailures) byStatus[f.status] = (byStatus[f.status] ?? 0) + 1;
+  console.log(`  by status: ${Object.entries(byStatus).map(([k, v]) => `${k}=${v}`).join(", ")}`);
+}
+process.exit(realFailures.length === 0 ? 0 : 1);
