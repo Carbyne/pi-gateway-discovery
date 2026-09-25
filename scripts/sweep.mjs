@@ -37,6 +37,21 @@ for (let i = 0; i < argv.length; i++) {
 }
 const opt = (name, dflt) => (opts[name] !== undefined ? opts[name] : dflt);
 
+/* -------------------------------------------------------------------------
+ * Cost guard.
+ *
+ * Every probe here is a REAL completion, and some registered models are
+ * expensive reasoning tiers billed per output token. A full sweep is therefore
+ * a spend of real money, not a free test, and must not run by accident.
+ *
+ * Default behaviour: refuse to run at all unless --yes-spend is given, and
+ * skip known-costly families even then unless --include-expensive. Prefer the
+ * free checks (`pi --list-models` for discovery, `verify.mjs` for effective
+ * config, `selftest.mjs` for logic) and reach for this only when you need to
+ * prove the backend accepts the payload.
+ * ----------------------------------------------------------------------- */
+const EXPENSIVE = /(-pro$|^o[134]-pro|gpt-5-[0-9]+-pro|^gpt-5-pro|realtime|deep-research)/iu;
+
 const STORE = positional[0] ?? opt("store", ".dev/agent/models-store.json");
 const KEY = opt("key", process.env.GATEWAY_API_KEY ?? process.env.PI_GATEWAY_API_KEY);
 const KEY_FROM = opt("key-from", undefined);
@@ -199,7 +214,22 @@ const store = JSON.parse(readFileSync(STORE, "utf8"));
 const models = Object.entries(store).flatMap(([gw, blob]) => (blob.models ?? []).map((m) => ({ ...m, provider: m.provider ?? gw })));
 const jobs = models.flatMap((m) => (m.reasoning ? LEVELS : ["off"]).map((lv) => [m, lv]));
 
-console.log(`\nSweeping ${models.length} models across ${Object.keys(store).length} gateways — ${jobs.length} probes\n`);
+const expensive = models.filter((m) => EXPENSIVE.test(m.id));
+const includeExpensive = argv.includes("--include-expensive");
+if (!includeExpensive) {
+  for (const m of expensive) {
+    const idx = models.indexOf(m);
+    if (idx >= 0) models.splice(idx, 1);
+  }
+}
+
+const planned = models.flatMap((m) => (m.reasoning ? LEVELS : ["off"])).length;
+console.log(`\nSweep: ${models.length} models across ${Object.keys(store).length} gateways = ${planned} REAL completions`);
+console.log(`  expensive tiers skipped: ${expensive.length}${includeExpensive ? " (INCLUDED via --include-expensive)" : " (default)"}${expensive.length && !includeExpensive ? `\n    ${expensive.slice(0, 8).map((m) => `${m.provider}/${m.id}`).join(", ")}${expensive.length > 8 ? " …" : ""}` : ""}`);
+if (!argv.includes("--yes-spend")) {
+  console.log("\nABORT: each probe bills real tokens. Re-run with --yes-spend to proceed.");
+  process.exit(2);
+}
 const lim = limiter(Number(opt("concurrency", 10)));
 const results = await Promise.all(jobs.map(([m, lv]) => probe(m, lv, lim)));
 const failures = results.filter((r) => r && !r.retriedAndPassed);

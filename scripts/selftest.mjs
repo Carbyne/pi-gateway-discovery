@@ -114,6 +114,18 @@ test("gemma-4 cannot switch thinking off", () => {
   assert.equal(m.high, "high");
 });
 
+test("an id and its alias resolve to the SAME configuration", () => {
+  // The gateway lists one model under several ids, all pointing at `name`.
+  // Rules keyed on the id can then configure the same backend two ways.
+  const a = resolveQuirk("zai-glm-5-2", "glm-5-2");
+  const b = resolveQuirk("glm-5-2", "glm-5-2");
+  assert.deepEqual(a?.thinkingLevelMap, b?.thinkingLevelMap);
+  const c = resolveQuirk("zai-glm-5", "zai-glm-5-3");
+  const d = resolveQuirk("zai-glm-latest", "zai-glm-5-3");
+  assert.deepEqual(c?.thinkingLevelMap, d?.thinkingLevelMap);
+  assert.equal(c?.thinkingLevelMap?.medium, null, "zai-glm-5-3 family rejects medium (measured)");
+});
+
 console.log("unusable / retired filters");
 
 test("excludes non-chat and capability-less families", () => {
@@ -136,14 +148,38 @@ test("excludes through a vendor namespace too", () => {
   assert.ok(unusableModelReason("acme/gpt-realtime-mini"));
 });
 
-test("retiredModelReason uses the date, not the presence of a date", () => {
+test("retiredModelReason compares the date rather than testing presence", () => {
   const now = Date.parse("2026-09-24T00:00:00Z");
+  // Past => retired; future => scheduled, still usable. This is the whole point:
+  // `o3-mini` here carries a future date and serves fine.
   assert.ok(retiredModelReason({ shutdown_date: "2026-07-23" }, now));
   assert.equal(retiredModelReason({ shutdown_date: "2026-10-23" }, now), undefined);
   assert.equal(retiredModelReason({ shutdown_date: null }, now), undefined);
   assert.equal(retiredModelReason({}, now), undefined);
-  assert.equal(retiredModelReason({ shutdown_date: "not-a-date" }, now), undefined);
 });
+
+test("retiredModelReason reads each vendor's own field name", () => {
+  const now = Date.parse("2026-09-24T00:00:00Z");
+  assert.ok(retiredModelReason({ deprecation: "2026-08-01" }, now), "mistral `deprecation`");
+  assert.ok(retiredModelReason({ ttlExpirationTime: "2026-08-01T00:00:00Z" }, now), "google `ttlExpirationTime`");
+  assert.ok(retiredModelReason({ deprecation: true }), "boolean flag");
+  assert.equal(retiredModelReason({ deprecation: false }), undefined, "false must not exclude");
+  // A truthy but unreadable value is still the vendor saying "retired".
+  // Excluding is the recoverable direction: it shows up in doctor with a
+  // reason and can be undone with excludeUnusable:false, whereas a wrongly
+  // kept model just fails at request time with an opaque error.
+  assert.ok(retiredModelReason({ shutdown_date: "not-a-date" }, now), "unparseable => retired");
+});
+
+test("deprecation_replacement_model is surfaced in the reason", () => {
+  const now = Date.parse("2026-09-24T00:00:00Z");
+  const reason = retiredModelReason(
+    { deprecation: "2026-08-01", deprecation_replacement_model: "mistral-large-2512" },
+    now,
+  );
+  assert.match(String(reason), /mistral-large-2512/u);
+});
+
 
 test("declared supported_efforts become the vocabulary, and beat name guessing", () => {
   const m = declaredThinkingLevelMap({ reasoning: { supported_efforts: ["xhigh", "medium", "low", "none"] } });
@@ -328,6 +364,58 @@ console.log("concurrent persistence (race regression)");
   });
 
   sandbox.dispose();
+}
+
+console.log("google native metadata");
+
+{
+  const { googleNativePatch, indexGoogleNativeModels } = await import("../src/quirks.ts");
+
+  test("native limits and thinking are translated", () => {
+    const p = googleNativePatch({
+      name: "models/gemini-3.8-flash",
+      inputTokenLimit: 1048576,
+      outputTokenLimit: 65536,
+      thinking: true,
+      supportedGenerationMethods: ["generateContent", "countTokens"],
+    });
+    assert.equal(p.contextWindow, 1048576);
+    assert.equal(p.maxTokens, 65536);
+    assert.equal(p.reasoning, true);
+    assert.equal(p.unusableReason, undefined);
+  });
+
+  test("absence of thinking must NOT clear a reasoning flag", () => {
+    const p = googleNativePatch({ name: "models/x", inputTokenLimit: 1000 });
+    assert.equal("reasoning" in p, false, "must stay unset when the vendor says nothing");
+  });
+
+  test("no generateContent method means unusable, whatever the id says", () => {
+    const p = googleNativePatch({ name: "models/aqa", supportedGenerationMethods: ["generateAnswer"] });
+    assert.match(String(p.unusableReason), /generateContent/u);
+  });
+
+  // Exclusion requires POSITIVE evidence of non-chat methods. An empty or
+  // absent list is missing data, not a statement, and must not drop a model —
+  // the same asymmetry that keeps `thinking` absence from clearing the flag.
+  test("empty or absent method list does not exclude", () => {
+    assert.equal(googleNativePatch({ name: "models/y", supportedGenerationMethods: [] })?.unusableReason, undefined);
+    assert.equal(googleNativePatch({ name: "models/y" })?.unusableReason, undefined);
+    // Positive evidence of non-chat methods DOES exclude.
+    assert.match(String(googleNativePatch({ name: "models/z", supportedGenerationMethods: ["countTokens"] })?.unusableReason), /generateContent/u);
+  });
+
+  test("native list indexes by bare name (prefix stripped)", () => {
+    const idx = indexGoogleNativeModels([
+      { name: "models/gemma-4-31b-it", thinking: true },
+      { name: "no-prefix-entry", inputTokenLimit: 5 },
+      "garbage",
+      null,
+    ]);
+    assert.equal(idx.get("gemma-4-31b-it").thinking, true);
+    assert.equal(idx.get("no-prefix-entry").inputTokenLimit, 5);
+    assert.equal(idx.size, 2);
+  });
 }
 
 console.log("source guards (silent-failure classes)");

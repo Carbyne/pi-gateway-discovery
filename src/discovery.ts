@@ -203,6 +203,9 @@ async function fetchJson(
 
 import {
   declaredThinkingLevelMap,
+  googleNativePatch,
+  indexGoogleNativeModels,
+  type GoogleNativeMetadata,
   resolveQuirk,
   retiredModelReason,
   unusableModelReason,
@@ -722,6 +725,48 @@ interface NegotiatedLane {
  * Anthropic-shaped lanes from OpenAI-shaped ones. Choosing between the two
  * OpenAI protocols stays a config/quirk-table decision.
  */
+/**
+ * Google's OpenAI-compatible shim returns no per-model metadata at all, so
+ * anything pi's built-in catalog does not already know falls through to the
+ * 32K/8K defaults — on lanes whose real windows are 1M/65K. The native list on
+ * the sibling path accepts the same key and carries the real limits, the
+ * authoritative `thinking` flag, and the method list.
+ *
+ * Only attempted when the lane actually looks like a Google shim (ids carrying
+ * the `models/` resource prefix). Strictly best-effort: an absent, slow, or
+ * differently-authenticated endpoint must not affect discovery at all.
+ */
+async function fetchGoogleNativeMetadata(
+  baseUrl: string,
+  apiKey: string,
+  enabled: boolean,
+  signal?: AbortSignal,
+): Promise<Map<string, GoogleNativeMetadata>> {
+  // Passed in, not read from module state: gateways are discovered concurrently
+  // in refreshStaleGateways, so a shared flag would let one lane read another's
+  // setting.
+  if (!enabled) return new Map();
+  const trimmed = baseUrl.replace(/\/+$/u, "");
+  const root = /\/openai$/iu.test(trimmed) ? trimmed.slice(0, -"/openai".length) : trimmed;
+  const candidates = [`${root}/models`, `${root}/v1beta/models`];
+  const headerSets: Array<Record<string, string>> = [
+    { accept: "application/json", "x-goog-api-key": apiKey },
+    { accept: "application/json", authorization: `Bearer ${apiKey}` },
+  ];
+  for (const endpoint of candidates) {
+    for (const headers of headerSets) {
+      const outcome = await fetchJson(endpoint, headers, signal);
+      if (outcome.status !== 200 || !outcome.json) continue;
+      const record = asRecord(outcome.json);
+      const list = record && Array.isArray(record.models) ? record.models : undefined;
+      if (!list || list.length === 0) continue;
+      const indexed = indexGoogleNativeModels(list);
+      if (indexed.size > 0) return indexed;
+    }
+  }
+  return new Map();
+}
+
 async function negotiateLane(
   gateway: GatewayConfig,
   apiKey: string,
@@ -768,6 +813,19 @@ export async function discoverGateway(
   const inferenceBaseUrl =
     api === "anthropic-messages" ? inferenceBaseUrlForApi(rawInferenceBaseUrl, api) : rawInferenceBaseUrl;
 
+  // Google native enrichment: only for shim lanes, never fatal.
+  const looksGoogleShim = entries.some(
+    (e) => typeof e.id === "string" && e.id.startsWith("models/"),
+  );
+  const nativeMeta = looksGoogleShim
+    ? await fetchGoogleNativeMetadata(
+        gateway.baseUrl,
+        apiKey,
+        gateway.googleNativeMetadata !== false,
+        signal,
+      ).catch(() => new Map())
+    : new Map<string, GoogleNativeMetadata>();
+
   // LiteLLM enrichment + health counts (parallel, best-effort).
   const [infoMap, healthCounts] = await Promise.all([
     fetchLiteLLMInfo(gateway.baseUrl, headers, signal).catch(() => null),
@@ -790,12 +848,17 @@ export async function discoverGateway(
     if (seen.has(id)) continue;
     seen.add(id);
 
+    // Several gateways expose one model under several ids via `aliases`, all
+    // pointing at the same `name`. Matching rules against that name as well as
+    // the id keeps alias entries configured identically.
+    const canonicalName = asString(entry.name) ?? asString(entry.display_name);
+
     // Never-register families: report the reason rather than dropping silently,
     // so "why is model X missing?" is answerable without re-reading the source.
     const unusable =
       gateway.excludeUnusable === false
         ? undefined
-        : unusableModelReason(id) ?? retiredModelReason(entry);
+        : unusableModelReason(id, canonicalName) ?? retiredModelReason(entry);
     if (unusable) {
       excludedUnusable.push({ id, reason: unusable });
       continue;
@@ -805,9 +868,43 @@ export async function discoverGateway(
     const mapped = mapGatewayModel(gateway, id, entry, info, api, inferenceBaseUrl);
     if (!mapped) continue;
 
+    // Native metadata outranks the shim's absence of data and pi's fuzzy
+    // built-in match, because it describes the checkpoint being served — but
+    // still below explicit config, which mapGatewayModel has already applied.
+    const native = nativeMeta.get(id);
+    const patch = googleNativePatch(native);
+    if (patch) {
+      const explicit = gateway.modelOverrides?.[id];
+      const applied: string[] = [];
+      if (patch.contextWindow !== undefined && explicit?.contextWindow === undefined) {
+        mapped.model.contextWindow = patch.contextWindow;
+        applied.push(`contextWindow=${patch.contextWindow}`);
+      }
+      if (patch.maxTokens !== undefined && explicit?.maxTokens === undefined) {
+        mapped.model.maxTokens = Math.min(patch.maxTokens, mapped.model.contextWindow);
+        applied.push(`maxTokens=${mapped.model.maxTokens}`);
+      }
+      if (patch.reasoning !== undefined) {
+        mapped.model.reasoning = patch.reasoning;
+        applied.push(`reasoning=${patch.reasoning}`);
+      }
+      if (patch.name && mapped.model.name === id) {
+        mapped.model.name = patch.name;
+      }
+      // A method list that lacks generateContent is positive evidence of a
+      // non-chat route, and beats any name-based guess.
+      if (patch.unusableReason && gateway.excludeUnusable !== false) {
+        excludedUnusable.push({ id, reason: patch.unusableReason });
+        continue;
+      }
+      if (applied.length > 0) {
+        quirksApplied.push({ id, note: `native Google metadata: ${applied.join(", ")}`, source: "declared" });
+      }
+    }
+
     // Protocol + thinking levels, in priority order:
     //   modelOverrides > upstream-declared vocabulary > quirk table > defaults
-    const quirk = resolveQuirk(id);
+    const quirk = resolveQuirk(id, canonicalName);
     const declared = declaredThinkingLevelMap(entry);
     const explicit = gateway.modelOverrides?.[id];
     const notes: string[] = [];

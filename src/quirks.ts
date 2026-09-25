@@ -84,17 +84,16 @@ export const MODEL_QUIRKS: readonly ModelQuirk[] = [
     // ZAI GLM fronted by a Mistral-style lane: a third, different vocabulary,
     // and omitting the parameter entirely is valid.
     //
-    // KNOWN IMPRECISION: measured against this deployment, `zai-glm-5`,
-    // `zai-glm-5-3` and `zai-glm-latest` accept low|high|max, but
-    // `zai-glm-5-2` accepts all six levels. A family-prefix rule cannot model
-    // that, so 5-2 gets the restrictive map and a user's "medium" clamps to
-    // "high" — every request still succeeds, but the level is not what was
-    // asked for. This is the inherent cost of name-keyed knowledge: it trades
-    // precision for coverage. Do not special-case the sibling (that encodes one
-    // deployment); fix it properly by having the upstream declare
-    // `reasoning.supported_efforts`, which this layer already prefers, or pin
-    // the model via modelOverrides.
-    match: /^zai-glm/u,
+    // Measured on this deployment, `glm-5-2` accepts every level while
+    // `zai-glm-5`, `zai-glm-5-3` and `zai-glm-latest` accept only low|high|max.
+    // Those are two different checkpoints, and the gateway exposes each under
+    // several aliases that all resolve to one `name`. A family prefix alone is
+    // therefore not enough: without the lookahead, `zai-glm-5-2` and its own
+    // alias `glm-5-2` resolve differently while being the same backend, and the
+    // more restrictive of the two wins. Keeping alias entries in agreement is
+    // the property that matters — a rule that configures one backend two ways
+    // is wrong regardless of which side you measure.
+    match: /^zai-glm(?![-._/]5[-._]2($|[-._/]))/u,
     thinkingLevelMap: { minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
     note: "GLM accepts reasoning_effort low|high|max; 'off' must omit the field",
   },
@@ -144,17 +143,27 @@ const UNUSABLE_PATTERNS: Array<{ match: RegExp; reason: string }> = [
  * than a matching bug — so every rule tests both the full id and the segment
  * after the last slash.
  */
-function idCandidates(id: string): string[] {
-  const normalized = id.toLowerCase();
-  const bare = normalized.includes("/")
-    ? normalized.slice(normalized.lastIndexOf("/") + 1)
-    : normalized;
-  return bare === normalized ? [normalized] : [normalized, bare];
+function idCandidates(id: string, ...extraNames: Array<string | undefined>): string[] {
+  const out = new Set<string>();
+  for (const value of [id, ...extraNames]) {
+    if (typeof value !== "string" || !value.trim()) continue;
+    const normalized = value.toLowerCase().trim();
+    out.add(normalized);
+    // Gateways namespace ids (`acme/gpt-5.5-pro`); a rule anchored on the bare
+    // model name would silently never fire on those lanes.
+    if (normalized.includes("/")) out.add(normalized.slice(normalized.lastIndexOf("/") + 1));
+    // Mistral-style gateways also expose the same model under several ids via
+    // `aliases`, all pointing at one `name`. Matching the name keeps alias
+    // entries configured identically instead of half the aliases getting a
+    // vocabulary and half not.
+    if (normalized.startsWith("models/")) out.add(normalized.slice("models/".length));
+  }
+  return [...out];
 }
 
 /** Returns the reason string when the id names a non-chat / unusable model. */
-export function unusableModelReason(id: string): string | undefined {
-  const candidates = idCandidates(id);
+export function unusableModelReason(id: string, ...extraNames: Array<string | undefined>): string | undefined {
+  const candidates = idCandidates(id, ...extraNames);
   return UNUSABLE_PATTERNS.find((p) => candidates.some((c) => p.match.test(c)))?.reason;
 }
 
@@ -173,8 +182,8 @@ export interface ResolvedQuirk {
  * narrow one's vocabulary never applies — which surfaces as an unrelated
  * 400 about `reasoning_effort`, not as a table bug.
  */
-export function resolveQuirk(id: string): ResolvedQuirk | undefined {
-  const candidates = idCandidates(id);
+export function resolveQuirk(id: string, ...extraNames: Array<string | undefined>): ResolvedQuirk | undefined {
+  const candidates = idCandidates(id, ...extraNames);
   const matched = MODEL_QUIRKS.filter((q) => candidates.some((c) => q.match.test(c)));
   if (matched.length === 0) return undefined;
 
@@ -254,10 +263,137 @@ export function declaredThinkingLevelMap(entry: RawEntryLike): Record<string, st
  * `shutdown_date`, which is why the name-based capability table is retained
  * alongside it.
  */
+/**
+ * Vendor names for "this model has been switched off", and the shapes seen:
+ *
+ *   OpenAI-compatible  `shutdown_date`: "2026-07-23" | null
+ *   Mistral            `deprecation`: "..." | { ... } | null
+ *                      `deprecation_replacement_model`: "mistral-large-2512" | null
+ *   Google (native)    `ttlExpirationTime`: RFC3339 | absent
+ *
+ * A date in the FUTURE is a scheduled retirement, not a dead model, so it is
+ * compared against `now` rather than merely tested for presence — `o3-mini`
+ * carries a future `shutdown_date` and serves fine. A truthy value that is not
+ * a recognisable date is treated as retired: the vendor said so, and no
+ * concrete retirement was announced.
+ */
+const RETIREMENT_FIELDS = [
+  "shutdown_date",
+  "deprecation",
+  "ttlExpirationTime",
+  "deprecation_date",
+  "retirement_date",
+] as const;
+
+function retirementValue(entry: RawEntryLike): { raw: unknown; field: string } | undefined {
+  const sources: RawEntryLike[] = [entry, asRecordLike(entry.capabilities) ?? {}];
+  for (const source of sources) {
+    for (const field of RETIREMENT_FIELDS) {
+      if (source[field] !== undefined && source[field] !== null) return { raw: source[field], field };
+    }
+  }
+  return undefined;
+}
+
 export function retiredModelReason(entry: RawEntryLike, now: number = Date.now()): string | undefined {
-  const raw = entry.shutdown_date ?? asRecordLike(entry.capabilities)?.shutdown_date;
-  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
-  const at = typeof raw === "number" ? raw : Date.parse(raw);
-  if (!Number.isFinite(at)) return undefined;
-  return at <= now ? `retired — shut down on ${raw}` : undefined;
+  const found = retirementValue(entry);
+  if (!found) return undefined;
+  const { raw, field } = found;
+
+  const replacement =
+    typeof entry.deprecation_replacement_model === "string" && entry.deprecation_replacement_model
+      ? entry.deprecation_replacement_model
+      : undefined;
+  const suffix = replacement ? ` — use ${replacement} instead` : "";
+
+  if (typeof raw === "boolean") {
+    return raw ? `retired (${field})${suffix}` : undefined;
+  }
+  const at = typeof raw === "number" ? raw : Date.parse(String(raw));
+  if (!Number.isFinite(at)) {
+    // Present but unreadable: still a deprecation statement from the vendor.
+    return `retired (${field}: ${JSON.stringify(raw)})${suffix}`;
+  }
+  return at <= now ? `retired — ${field} ${String(raw)}${suffix}` : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Google native model metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields from Google's *native* `GET {base}/models`, which the OpenAI-compatible
+ * shim does not surface at all. The shim's entries carry only
+ * `id/object/owned_by/display_name`, so anything pi does not already know from
+ * its built-in catalog falls back to the 32K/8K defaults — on a lane whose real
+ * windows are 1M/65K.
+ *
+ * Reachable with the same key via `x-goog-api-key`, and authoritative for the
+ * checkpoint actually being served.
+ */
+export interface GoogleNativeMetadata {
+  name?: string;
+  displayName?: string;
+  description?: string;
+  inputTokenLimit?: number;
+  outputTokenLimit?: number;
+  thinking?: boolean;
+  supportedGenerationMethods?: string[];
+  ttlExpirationTime?: string;
+}
+
+export interface GoogleNativePatch {
+  contextWindow?: number;
+  maxTokens?: number;
+  /** Only set when the native list states it; absence must not clear a flag. */
+  reasoning?: boolean;
+  name?: string;
+  unusableReason?: string;
+}
+
+/**
+ * Translate one native entry into catalog fields.
+ *
+ * `inputTokenLimit` is used as the context window: Gemini bills input and
+ * output against one budget, so the input limit is the conservative reading
+ * and never overstates the window — which is the failure that actually hurts,
+ * since pi sizes compaction and output reservations from it.
+ *
+ * `supportedGenerationMethods` replaces name-based guessing where it exists:
+ * a model exposing only `generateAnswer` (e.g. `aqa`) is not a chat model
+ * whatever its id says. Absence of the field is not treated as capability.
+ */
+export function googleNativePatch(entry: GoogleNativeMetadata | undefined): GoogleNativePatch | undefined {
+  if (!entry) return undefined;
+  const patch: GoogleNativePatch = {};
+
+  const input = typeof entry.inputTokenLimit === "number" ? entry.inputTokenLimit : undefined;
+  const output = typeof entry.outputTokenLimit === "number" ? entry.outputTokenLimit : undefined;
+  if (input !== undefined) patch.contextWindow = input;
+  if (output !== undefined) patch.maxTokens = output;
+
+  if (typeof entry.thinking === "boolean") patch.reasoning = entry.thinking;
+  if (typeof entry.displayName === "string" && entry.displayName.trim()) patch.name = entry.displayName.trim();
+
+  const methods = Array.isArray(entry.supportedGenerationMethods)
+    ? entry.supportedGenerationMethods.filter((m): m is string => typeof m === "string")
+    : undefined;
+  if (methods && methods.length > 0 && !methods.includes("generateContent")) {
+    patch.unusableReason = `Google lists no generateContent for this model (methods: ${methods.join(", ") || "none"})`;
+  }
+
+  return Object.keys(patch).length > 0 ? patch : undefined;
+}
+
+/** Index a native `models[]` array by bare name, stripping Google's prefix. */
+export function indexGoogleNativeModels(entries: unknown): Map<string, GoogleNativeMetadata> {
+  const out = new Map<string, GoogleNativeMetadata>();
+  if (!Array.isArray(entries)) return out;
+  for (const raw of entries) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const entry = raw as GoogleNativeMetadata;
+    if (typeof entry.name !== "string" || !entry.name) continue;
+    out.set(entry.name.replace(/^models\//u, ""), entry);
+  }
+  return out;
 }

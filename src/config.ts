@@ -59,6 +59,14 @@ export interface GatewayConfig {
    */
   excludeUnusable?: boolean;
   /**
+   * Query Google's native model list for lanes that expose the OpenAI shim
+   * (which returns only `id/object/owned_by/display_name`) to recover
+   * `inputTokenLimit`, `outputTokenLimit`, `thinking` and
+   * `supportedGenerationMethods`. Best-effort: any failure falls back to the
+   * shim's data. Default true; set false to disable the extra request.
+   */
+  googleNativeMetadata?: boolean;
+  /**
    * Route streaming inference requests through a node:http/https-backed
    * fetch instead of the global (undici) fetch. Set this for gateways that
    * only negotiate HTTP/1.1: undici can buffer the entire chunked response
@@ -277,6 +285,7 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
       ...(excludedModels && excludedModels.length > 0 ? { excludedModels } : {}),
       // Preserve an explicit false: the effective default is true.
       ...(item.excludeUnusable === false ? { excludeUnusable: false } : {}),
+      ...(item.googleNativeMetadata === false ? { googleNativeMetadata: false } : {}),
       ...(typeof item.directHttpStreaming === "boolean" && item.directHttpStreaming ? { directHttpStreaming: true } : {}),
     };
   });
