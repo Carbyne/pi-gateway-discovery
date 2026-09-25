@@ -2,3 +2,8 @@ node_modules/
 *.tgz
 *.tmp
 .DS_Store
+
+# local dev harness — never contains secrets (keys are read from the real
+# auth.json at launch and only placed in the environment)
+.dev/
+.tools/
