@@ -105,6 +105,14 @@ export const MODEL_QUIRKS: readonly ModelQuirk[] = [
  * `search-api` / `search-preview` forms that lack function calling.
  */
 const UNUSABLE_PATTERNS: Array<{ match: RegExp; reason: string }> = [
+  // Not chat models at all — carried over from discovery's original filter,
+  // now routed through one predicate so there is a single place to audit.
+  { match: /(^|[/:._-])(embed|embedding|bge|gte|e5|rerank)([/:._-]|$)/u, reason: "embedding / reranker model" },
+  { match: /nomic-embed/u, reason: "embedding model" },
+  { match: /(^|[/:._-])(tts|whisper|transcribe|speech|audio)([/:._-]|$)/u, reason: "audio / speech model" },
+  { match: /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage|sora)([/:._-]|$)/u, reason: "moderation, OCR, or image/video model" },
+  { match: /(^|[/:._-])(veo|lyria|robotics|live)([/:._-]|$)/u, reason: "generation/live model (video, music, teleop)" },
+  // Chat-shaped but unusable through a chat-completions client.
   { match: /(^|[/:._-])realtime([/:._-]|$)/u, reason: "realtime voice/session API, not chat completions" },
   { match: /(^|[/:._-])computer-use([/:._-]|$)/u, reason: "requires the vendor Computer Use tool" },
   { match: /(^|[/:._-])(search-api|search-preview)([/:._-]|$)/u, reason: "no function calling; unusable as an agent model" },
@@ -168,4 +176,77 @@ export function resolveQuirk(id: string): ResolvedQuirk | undefined {
     resolved.notes.push(q.note);
   }
   return resolved;
+}
+
+// ---------------------------------------------------------------------------
+// Upstream-declared metadata
+//
+// Read from the raw `/models` entry. Where an upstream states a fact about a
+// model, that statement beats any name-based guess below: it is authoritative,
+// free (already in the payload), and it cannot rot when the vendor changes a
+// checkpoint.
+// ---------------------------------------------------------------------------
+
+/** Minimal structural view of a raw `/models` entry, to stay import-light. */
+export type RawEntryLike = Record<string, unknown>;
+
+function asRecordLike(value: unknown): RawEntryLike | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as RawEntryLike)
+    : undefined;
+}
+
+/**
+ * Effort vocabulary declared by the model list itself.
+ *
+ * vLLM / InferHub-style upstreams publish `reasoning.supported_efforts`. When
+ * present it is authoritative and must beat every name-based guess, because
+ * the vocabulary is a property of *this served checkpoint on this backend*
+ * rather than of the model family: the same `mistral-medium` name answers
+ * `none|high` on one deployment and the full OpenAI set on another. It is
+ * also free — the field is already in the payload we fetched.
+ *
+ * Not universal: on this gateway only one lane's entries carry it, so the
+ * quirk table remains the fallback where the upstream says nothing.
+ */
+export function declaredThinkingLevelMap(entry: RawEntryLike): Record<string, string | null> | undefined {
+  const reasoning = asRecordLike(entry.reasoning);
+  const raw = reasoning?.supported_efforts;
+  if (!Array.isArray(raw)) return undefined;
+  const supported = new Set(
+    raw.filter((v): v is string => typeof v === "string").map((v) => v.toLowerCase()),
+  );
+  if (supported.size === 0) return undefined;
+
+  const map: Record<string, string | null> = {};
+  // "off" is only honoured when the backend accepts an explicit "none"; a null
+  // here makes pi clamp a user's "off" to the cheapest real level instead of
+  // sending a value the backend rejects.
+  map.off = supported.has("none") ? "none" : null;
+  for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
+    map[level] = supported.has(level) ? level : null;
+  }
+  return map;
+}
+
+/**
+ * A model the upstream has already switched off.
+ *
+ * Several OpenAI-compatible `/models` payloads carry `shutdown_date`. It is
+ * compared against *now* rather than treated as "has a shutdown date": a
+ * scheduled future retirement is a warning, not grounds for hiding a working
+ * model (a lane here lists `o3-mini` with a future date and it serves fine).
+ *
+ * Preferred to a hard-coded list of retired ids, which rots the moment the
+ * vendor retires another one — and free, since the field is already in the
+ * list we fetched. Not complete on its own: some retired ids ship a null
+ * `shutdown_date`, which is why the name-based capability table is retained
+ * alongside it.
+ */
+export function retiredModelReason(entry: RawEntryLike, now: number = Date.now()): string | undefined {
+  const raw = entry.shutdown_date ?? asRecordLike(entry.capabilities)?.shutdown_date;
+  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
+  const at = typeof raw === "number" ? raw : Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  return at <= now ? `retired — shut down on ${raw}` : undefined;
 }

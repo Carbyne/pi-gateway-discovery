@@ -22,7 +22,7 @@
 
 import { existsSync, readFileSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
-import { AUTH_PATH, MODELS_STORE_PATH, type GatewayConfig, type GatewayConfigFile } from "./config.ts";
+import { AUTH_PATH, CONFIG_PATH, MODELS_STORE_PATH, type GatewayConfig, type GatewayConfigFile } from "./config.ts";
 import { discoverGateway } from "./discovery.ts";
 
 export const AUTO_REFRESH_DEFAULT_TTL_HOURS = 1;
@@ -205,6 +205,40 @@ export async function refreshStaleGateways(
  * other tools) swap the inode and would silently kill a file-level
  * inotify watch. Returns a stop function. Best-effort.
  */
+/**
+ * Watch gateway-discovery.json for edits made outside this session.
+ *
+ * Own writes are harmless rather than suppressed: the writer updates its own
+ * fingerprint before the file settles, so the callback reconciles and finds
+ * nothing to do.
+ */
+export function startConfigWatcher(opts: { onExternalChange: () => void }): () => void {
+  let watcher: FSWatcher | undefined;
+  let debounce: NodeJS.Timeout | undefined;
+  try {
+    const dir = dirname(CONFIG_PATH);
+    const fileName = basename(CONFIG_PATH);
+    if (existsSync(dir)) {
+      watcher = watch(dir, { persistent: false }, (_eventType, changed) => {
+        if (changed && changed !== fileName) return;
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(() => opts.onExternalChange(), 300);
+        debounce.unref?.();
+      });
+    }
+  } catch {
+    // Watching is best-effort; ignore.
+  }
+  return () => {
+    if (debounce) clearTimeout(debounce);
+    try {
+      watcher?.close();
+    } catch {
+      // Already closed.
+    }
+  };
+}
+
 export function startStoreWatcher(opts: {
   getGatewayIds: () => string[];
   onExternalChange: (gatewayIds: string[]) => void;

@@ -273,6 +273,74 @@ export async function loadConfig(): Promise<GatewayConfigFile> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Change detection
+// ---------------------------------------------------------------------------
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+/** Key-order-insensitive fingerprint, so a merely reordered file is not a change. */
+export function fingerprintConfig(config: GatewayConfigFile): string {
+  return stableStringify(config);
+}
+
+export interface ConfigDelta {
+  added: string[];
+  removed: string[];
+  modified: string[];
+  /** Whether the refresh TTL changed (affects scheduling, not providers). */
+  ttlChanged: boolean;
+  changed: boolean;
+}
+
+const NO_DELTA: ConfigDelta = { added: [], removed: [], modified: [], ttlChanged: false, changed: false };
+
+/**
+ * Compare two loaded configs by gateway id.
+ *
+ * Exists because `configFile` is captured at extension load and every provider
+ * closes over its own `GatewayConfig`. Editing the file on disk (or having
+ * another session edit it) therefore leaves `sync` re-deriving models from the
+ * *stale* object while still reporting `state: "ok"` with a model count —
+ * indistinguishable from success. Callers diff, re-register what moved, and
+ * surface the rest as drift.
+ */
+export function diffGatewayConfigs(before: GatewayConfigFile, after: GatewayConfigFile): ConfigDelta {
+  if (before === after) return NO_DELTA;
+  const beforeById = new Map(before.gateways.map((g) => [g.id, g]));
+  const afterById = new Map(after.gateways.map((g) => [g.id, g]));
+
+  const added: string[] = [];
+  const modified: string[] = [];
+  const removed: string[] = [];
+
+  for (const [id, gateway] of afterById) {
+    const previous = beforeById.get(id);
+    if (!previous) added.push(id);
+    else if (stableStringify(previous) !== stableStringify(gateway)) modified.push(id);
+  }
+  for (const id of beforeById.keys()) {
+    if (!afterById.has(id)) removed.push(id);
+  }
+
+  const ttlChanged = before.autoRefreshTtlHours !== after.autoRefreshTtlHours;
+  return {
+    added,
+    removed,
+    modified,
+    ttlChanged,
+    changed: added.length + removed.length + modified.length > 0 || ttlChanged,
+  };
+}
+
 export async function saveConfig(next: GatewayConfigFile): Promise<void> {
   await mkdir(dirname(CONFIG_PATH), { recursive: true });
   const tempPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;

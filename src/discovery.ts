@@ -195,7 +195,9 @@ async function fetchJson(
 }
 
 import {
+  declaredThinkingLevelMap,
   resolveQuirk,
+  retiredModelReason,
   unusableModelReason,
 } from "./quirks.ts";
 
@@ -503,56 +505,6 @@ function normalizeModelId(id: string): string {
   return id.startsWith("models/") ? id.slice("models/".length) : id;
 }
 
-/**
- * Models that are not chat models — never register them. Covers
- * embedding/reranker families plus obvious audio/speech, moderation, OCR,
- * image-generation, and legacy non-chat completions families.
- */
-function isNonChatModel(id: string): boolean {
-  const normalized = id.toLowerCase();
-  return (
-    /(^|[/:._-])(embed|embedding|bge|gte|e5|rerank)([/:._-]|$)/u.test(normalized) ||
-    normalized.includes("nomic-embed") ||
-    /(^|[/:._-])(tts|whisper|transcribe|speech|audio)([/:._-]|$)/u.test(normalized) ||
-    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage|sora)([/:._-]|$)/u.test(normalized) ||
-    // Gemini-specific generation/live families (veo=video, lyria=music)
-    /(^|[/:._-])(veo|lyria|robotics|live)([/:._-]|$)/u.test(normalized)
-  );
-}
-
-/**
- * Effort vocabulary declared by the model list itself.
- *
- * vLLM / InferHub-style upstreams publish `reasoning.supported_efforts`. When
- * present it is authoritative and must beat every name-based guess, because
- * the vocabulary is a property of *this served checkpoint on this backend*
- * rather than of the model family: the same `mistral-medium` name answers
- * `none|high` on one deployment and the full OpenAI set on another. It is
- * also free — the field is already in the payload we fetched.
- *
- * Not universal: on this gateway only one lane's entries carry it, so the
- * quirk table remains the fallback where the upstream says nothing.
- */
-export function declaredThinkingLevelMap(entry: RawEntry): Record<string, string | null> | undefined {
-  const reasoning = asRecord(entry.reasoning);
-  const raw = reasoning?.supported_efforts;
-  if (!Array.isArray(raw)) return undefined;
-  const supported = new Set(
-    raw.filter((v): v is string => typeof v === "string").map((v) => v.toLowerCase()),
-  );
-  if (supported.size === 0) return undefined;
-
-  const map: Record<string, string | null> = {};
-  // "off" is only honoured when the backend accepts an explicit "none"; a null
-  // here makes pi clamp a user's "off" to the cheapest real level instead of
-  // sending a value the backend rejects.
-  map.off = supported.has("none") ? "none" : null;
-  for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
-    map[level] = supported.has(level) ? level : null;
-  }
-  return map;
-}
-
 interface MappedModel {
   model: Model<Api>;
   source: string; // "builtin:provider/id" | "gateway"
@@ -560,27 +512,6 @@ interface MappedModel {
   maxTokensCapped?: { reported: number };
 }
 
-/**
- * A model the upstream has already switched off.
- *
- * Several OpenAI-compatible `/models` payloads carry `shutdown_date`. It is
- * compared against *now* rather than treated as "has a shutdown date": a
- * scheduled future retirement is a warning, not grounds for hiding a working
- * model (a lane here lists `o3-mini` with a future date and it serves fine).
- *
- * Preferred to a hard-coded list of retired ids, which rots the moment the
- * vendor retires another one — and free, since the field is already in the
- * list we fetched. Not complete on its own: some retired ids ship a null
- * `shutdown_date`, which is why the name-based capability table is retained
- * alongside it.
- */
-export function retiredModelReason(entry: RawEntry, now: number = Date.now()): string | undefined {
-  const raw = entry.shutdown_date ?? asRecord(entry.capabilities)?.shutdown_date;
-  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
-  const at = typeof raw === "number" ? raw : Date.parse(raw);
-  if (!Number.isFinite(at)) return undefined;
-  return at <= now ? `retired — shut down on ${raw}` : undefined;
-}
 
 function mapGatewayModel(
   gateway: GatewayConfig,
@@ -590,7 +521,6 @@ function mapGatewayModel(
   api: GatewayApi,
   inferenceBaseUrl: string,
 ): MappedModel | null {
-  if (isNonChatModel(id)) return null;
   if (gateway.excludedModels?.includes(id)) return null;
 
   const builtin = lookupBuiltin(id);
@@ -857,9 +787,7 @@ export async function discoverGateway(
     const unusable =
       gateway.excludeUnusable === false
         ? undefined
-        : isNonChatModel(id)
-          ? "non-chat model (embedding/audio/image/etc.)"
-          : unusableModelReason(id) ?? retiredModelReason(entry);
+        : unusableModelReason(id) ?? retiredModelReason(entry);
     if (unusable) {
       excludedUnusable.push({ id, reason: unusable });
       continue;

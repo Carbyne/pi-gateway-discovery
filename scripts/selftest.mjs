@@ -1,0 +1,207 @@
+#!/usr/bin/env node
+/**
+ * Deterministic tests for the knowledge layer: the quirk table, the unusable /
+ * retired filters, and config diffing. No network, no pi runtime.
+ *
+ * These encode mistakes that were actually made while building the table, each
+ * of which presented as an unrelated runtime error rather than a table bug:
+ *   - a bare `-pro$` suffix re-routing another vendor's model
+ *   - first-match-wins hiding a narrow rule behind a broad one
+ *   - a blanket `off: null` breaking models that accept `none`
+ *   - rules silently not firing on `vendor/`-namespaced ids
+ *   - an over-broad filter excluding `llama-3-8b-instruct`, a real chat model
+ *
+ *   node --experimental-strip-types scripts/selftest.mjs
+ */
+import assert from "node:assert/strict";
+import {
+  declaredThinkingLevelMap,
+  resolveQuirk,
+  retiredModelReason,
+  unusableModelReason,
+} from "../src/quirks.ts";
+import { diffGatewayConfigs, fingerprintConfig } from "../src/config.ts";
+
+let passed = 0;
+const failures = [];
+const test = (name, fn) => {
+  try { fn(); passed++; }
+  catch (error) { failures.push(`${name}\n    ${error.message.split("\n").slice(0, 3).join("\n    ")}`); }
+};
+const api = (id) => resolveQuirk(id)?.api;
+
+console.log("\nquirk table");
+
+test("does not leak across vendors: gemini-2.5-pro stays on its lane protocol", () => {
+  assert.equal(api("gemini-2.5-pro"), undefined);
+  assert.equal(api("yoda/gemini-2.5-pro"), undefined);
+});
+
+test("does not leak across vendors: mistral-medium-3-pro is not an OpenAI pro", () => {
+  assert.equal(api("mistral-medium-3-pro"), undefined);
+});
+
+test("routes gpt-5.4+ / gpt-6 to /responses", () => {
+  for (const id of ["gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra", "gpt-5.3-codex"])
+    assert.equal(api(id), "openai-responses", id);
+});
+
+test("does NOT route older models that work on /chat/completions", () => {
+  for (const id of ["gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5-mini", "o1", "o3", "o3-mini", "o4-mini", "gpt-4o"])
+    assert.equal(api(id), undefined, id);
+});
+
+test("narrow rule survives the broad rule: gpt-5-pro keeps a high-only vocabulary", () => {
+  const m = resolveQuirk("gpt-5-pro");
+  assert.equal(m.api, "openai-responses");
+  assert.equal(m.thinkingLevelMap.low, null);
+  assert.equal(m.thinkingLevelMap.medium, null);
+  assert.equal(m.thinkingLevelMap.high, "high");
+});
+
+test("gpt-5.x-pro accepts medium/high/xhigh and rejects low", () => {
+  const m = resolveQuirk("gpt-5.5-pro").thinkingLevelMap;
+  assert.equal(m.low, null);
+  assert.equal(m.medium, "medium");
+  assert.equal(m.xhigh, "xhigh");
+});
+
+test("o-series pro rejects both 'none' and 'minimal'", () => {
+  const m = resolveQuirk("o1-pro").thinkingLevelMap;
+  assert.equal(m.off, null);
+  assert.equal(m.minimal, null);
+  assert.equal(m.low, "low");
+});
+
+test("gpt-5.4+/gpt-6 keep 'off' usable, because they accept an explicit none", () => {
+  // Regression: a blanket off:null here makes pi clamp "off" up to `minimal`,
+  // which these models reject.
+  const m = resolveQuirk("gpt-5.6-terra").thinkingLevelMap;
+  assert.notEqual(m?.off, null);
+});
+
+test("rules fire through vendor id namespaces", () => {
+  assert.deepEqual(resolveQuirk("yoda/mistral-medium-3.5").thinkingLevelMap.low, null);
+  assert.deepEqual(resolveQuirk("openai/gpt-5.5-pro").api, "openai-responses");
+});
+
+test("mistral medium/small family speaks only none|high", () => {
+  for (const id of ["mistral-medium-3.5", "magistral-small-latest", "mistral-vibe-cli-latest"]) {
+    const m = resolveQuirk(id).thinkingLevelMap;
+    assert.equal(m.off, "none", id);
+    assert.equal(m.low, null, id);
+    assert.equal(m.high, "high", id);
+  }
+});
+
+test("zai-glm speaks low|high|max and can omit the field", () => {
+  const m = resolveQuirk("zai-glm-latest").thinkingLevelMap;
+  assert.equal(m.medium, null);
+  assert.equal(m.max, "max");
+  assert.equal("off" in m, false);
+});
+
+test("gemma-4 cannot switch thinking off", () => {
+  const m = resolveQuirk("gemma-4-31b-it").thinkingLevelMap;
+  assert.equal(m.off, null);
+  assert.equal(m.high, "high");
+});
+
+console.log("unusable / retired filters");
+
+test("excludes non-chat and capability-less families", () => {
+  for (const id of ["gpt-realtime-2", "computer-use-preview", "gpt-4o-search-preview", "o3-deep-research",
+                    "gpt-3.5-turbo-instruct", "voxtral-mini-latest", "gemini-omni-1.1-flash",
+                    "antigravity-preview-latest", "aqa", "text-embedding-3-large",
+                    "bge-reranker-v2", "whisper-1", "dall-e-3", "nomic-embed-text"])
+    assert.ok(unusableModelReason(id), `${id} should be excluded`);
+});
+
+test("does NOT exclude real chat models whose names merely look similar", () => {
+  // `instruct` is the trap: llama-*-instruct models are ordinary chat models,
+  // and only the legacy turbo-instruct completions-only pair are not.
+  for (const id of ["llama-3.3-70b-instruct", "mistral-7b-instruct", "qwen2.5-coder-instruct",
+                    "gpt-5.1-codex", "phi-4-reasoning", "deepseek-r1"])
+    assert.equal(unusableModelReason(id), undefined, `${id} must stay registered`);
+});
+
+test("excludes through a vendor namespace too", () => {
+  assert.ok(unusableModelReason("yoda/gpt-realtime-mini"));
+});
+
+test("retiredModelReason uses the date, not the presence of a date", () => {
+  const now = Date.parse("2026-09-24T00:00:00Z");
+  assert.ok(retiredModelReason({ shutdown_date: "2026-07-23" }, now));
+  assert.equal(retiredModelReason({ shutdown_date: "2026-10-23" }, now), undefined);
+  assert.equal(retiredModelReason({ shutdown_date: null }, now), undefined);
+  assert.equal(retiredModelReason({}, now), undefined);
+  assert.equal(retiredModelReason({ shutdown_date: "not-a-date" }, now), undefined);
+});
+
+test("declared supported_efforts become the vocabulary, and beat name guessing", () => {
+  const m = declaredThinkingLevelMap({ reasoning: { supported_efforts: ["xhigh", "medium", "low", "none"] } });
+  assert.deepEqual(m, { off: "none", minimal: null, low: "low", medium: "medium", high: null, xhigh: "xhigh", max: null });
+  assert.equal(declaredThinkingLevelMap({ reasoning: null }), undefined);
+  assert.equal(declaredThinkingLevelMap({ reasoning: { supported_efforts: [] } }), undefined);
+});
+
+console.log("config diffing (hot reload)");
+
+const gw = (id, extra = {}) => ({ id, name: "X", baseUrl: "https://e/x", ...extra });
+const cfg = (gateways, ttl) => ({ version: 1, ...(ttl ? { autoRefreshTtlHours: ttl } : {}), gateways });
+
+test("no change is not reported as a change", () => {
+  const a = cfg([gw("g1"), gw("g2")]);
+  assert.equal(diffGatewayConfigs(a, a).changed, false);
+  assert.equal(diffGatewayConfigs(cfg([gw("g1")]), cfg([gw("g1")])).changed, false);
+});
+
+test("key order inside a gateway is not a change", () => {
+  const k1 = { id: "g1", name: "X", baseUrl: "https://e/x", compat: { supportsStore: false } };
+  const k2 = { compat: { supportsStore: false }, baseUrl: "https://e/x", name: "X", id: "g1" };
+  assert.equal(diffGatewayConfigs(cfg([k1]), cfg([k2])).changed, false);
+});
+
+test("added, removed and modified are classified", () => {
+  const before = cfg([gw("keep"), gw("edit"), gw("gone")]);
+  const after = cfg([gw("keep"), gw("edit", { api: "anthropic-messages" }), gw("new")]);
+  const d = diffGatewayConfigs(before, after);
+  assert.deepEqual(d.added, ["new"]);
+  assert.deepEqual(d.removed, ["gone"]);
+  assert.deepEqual(d.modified, ["edit"]);
+  assert.equal(d.changed, true);
+});
+
+test("nested thinkingLevelMap edits count as modifications", () => {
+  const o = { "m1": { thinkingLevelMap: { low: "low" } } };
+  const d = diffGatewayConfigs(cfg([gw("g", { modelOverrides: o })]),
+    cfg([gw("g", { modelOverrides: { "m1": { thinkingLevelMap: { low: null } } } })]));
+  assert.deepEqual(d.modified, ["g"]);
+});
+
+test("a TTL-only change is flagged without touching providers", () => {
+  const d = diffGatewayConfigs(cfg([gw("g")], 1), cfg([gw("g")], 24));
+  assert.equal(d.ttlChanged, true);
+  assert.equal(d.changed, true);
+  assert.equal(d.modified.length, 0);
+});
+
+test("fingerprint ignores key order but not content", () => {
+  const one = { version: 1, gateways: [{ id: "g", name: "X", baseUrl: "https://e/x" }] };
+  const two = { gateways: [{ baseUrl: "https://e/x", name: "X", id: "g" }], version: 1 };
+  assert.equal(fingerprintConfig(one), fingerprintConfig(two));
+  assert.notEqual(fingerprintConfig(cfg([gw("a")])),
+    fingerprintConfig(cfg([gw("a", { api: "openai-responses" })])));
+});
+
+test("diffing is insensitive to gateway order (reordering causes no re-registration)", () => {
+  assert.equal(diffGatewayConfigs(cfg([gw("a"), gw("b")]), cfg([gw("b"), gw("a")])).changed, false);
+});
+
+// --- report ---------------------------------------------------------------
+console.log(`\n${passed} passed, ${failures.length} failed`);
+if (failures.length) {
+  console.log("\nFAILURES:");
+  for (const f of failures) console.log(`  ✗ ${f}`);
+  process.exit(1);
+}
