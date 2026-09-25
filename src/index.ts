@@ -57,6 +57,7 @@ import {
   parseGatewayConfig,
   saveConfig,
   saveDiscoveryMeta,
+  setStoredApiKey,
   suggestGatewayIdentity,
   validateGatewayId,
   type ConfigDelta,
@@ -111,6 +112,8 @@ interface SyncInfo {
   /** Protocol actually used, and whether config or negotiation chose it. */
   api?: GatewayApi;
   apiSource?: "explicit" | "negotiated";
+  /** Set when the provenance/exclusion record failed to persist. */
+  metaWriteError?: string;
   error?: string;
 }
 
@@ -124,6 +127,13 @@ let loadedConfigFingerprint = "";
  * rather than letting `state: "ok"` imply everything is current.
  */
 const driftedGateways = new Set<string>();
+
+/**
+ * Per-gateway failures to persist discovery metadata (provenance/exclusions).
+ * Recorded, never printed: console output during startup lands in the TUI
+ * composer, so a transient write error would interrupt the user's typing.
+ */
+const metaWriteErrors = new Map<string, string>();
 
 /** Mirror of gateway-discovery-meta.json, refreshed on load and on write. */
 let persistedMeta: Record<string, GatewayDiscoveryMeta> = {};
@@ -194,10 +204,14 @@ async function recordDiscoveryMeta(
   persistedMeta = { ...persistedMeta, [gatewayId]: meta };
   try {
     await saveDiscoveryMeta(gatewayId, meta);
+    metaWriteErrors.delete(gatewayId);
   } catch (error) {
-    // Reporting data, not the catalog itself — but say so, rather than
-    // swallowing it: a silently missing file reads as "nothing was excluded".
-    console.error(`[gateway-discovery] could not persist discovery metadata for ${gatewayId}: ${errorMessage(error)}`);
+    // Reporting data, not the catalog itself, so this must never fail a sync.
+    // It is recorded rather than logged: anything written to stdout/stderr
+    // during startup lands in the composer on a TUI session, which turns a
+    // diagnostic into user-visible noise at the worst possible moment.
+    // `/gw list` and `/gw doctor` surface it instead.
+    metaWriteErrors.set(gatewayId, errorMessage(error));
   }
 }
 
@@ -553,25 +567,7 @@ async function addGateway(
 
   // If an API token was provided, store it in auth.json
   if (params.apiToken?.trim()) {
-    const tempPath = `${AUTH_PATH}.${process.pid}.${Date.now()}.tmp`;
-    try {
-      await mkdir(dirname(AUTH_PATH), { recursive: true });
-      const auth = await (async () => {
-        try {
-          const content = await readFile(AUTH_PATH, "utf8");
-          return JSON.parse(content) as Record<string, unknown>;
-        } catch {
-          return {};
-        }
-      })();
-      auth[id] = { type: "api_key", key: params.apiToken.trim() };
-      await writeFile(tempPath, `${JSON.stringify(auth, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-      await rename(tempPath, AUTH_PATH);
-      await chmod(AUTH_PATH, 0o600);
-    } catch (error) {
-      await rm(tempPath, { force: true });
-      throw error;
-    }
+    await setStoredApiKey(id, params.apiToken.trim());
   }
 
   return {
@@ -650,6 +646,7 @@ function summarizeSync(id: string): Record<string, unknown> {
     ...(info.maxTokensCappedCount ? { maxTokensCapped: info.maxTokensCappedCount } : {}),
     ...(info.excludedUnusableCount ? { excludedUnusable: info.excludedUnusableCount } : {}),
     ...(info.quirksAppliedCount ? { quirksApplied: info.quirksAppliedCount } : {}),
+    ...(info.metaWriteError ? { metaWriteError: info.metaWriteError } : {}),
     ...(info.healthyEndpoints !== undefined
       ? { healthyEndpoints: info.healthyEndpoints, unhealthyEndpoints: info.unhealthyEndpoints ?? 0 }
       : {}),
@@ -824,27 +821,11 @@ async function readStoredApiKeys(): Promise<Record<string, string>> {
 }
 
 async function mergeStoredApiKeys(credentials: Record<string, string>): Promise<string[]> {
-  const tempPath = `${AUTH_PATH}.${process.pid}.${Date.now()}.tmp`;
-  let auth: Record<string, unknown> = {};
-  try {
-    auth = JSON.parse(await readFile(AUTH_PATH, "utf8")) as Record<string, unknown>;
-  } catch {
-    // No auth file yet.
-  }
   const written: string[] = [];
   for (const [id, key] of Object.entries(credentials)) {
     if (typeof key !== "string" || !key) continue;
-    auth[id] = { type: "api_key", key };
+    await setStoredApiKey(id, key);
     written.push(id);
-  }
-  await mkdir(dirname(AUTH_PATH), { recursive: true });
-  try {
-    await writeFile(tempPath, `${JSON.stringify(auth, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(tempPath, AUTH_PATH);
-    await chmod(AUTH_PATH, 0o600);
-  } catch (error) {
-    await rm(tempPath, { force: true });
-    throw error;
   }
   return written;
 }
@@ -1062,6 +1043,15 @@ export function doctorGateways(
     if (live?.ok && models.length === 0) {
       issues.push("catalog is empty — every model was filtered or excluded");
     }
+    // A failed metadata write costs reporting fidelity, not function: the
+    // catalog itself is fine. Warn rather than fail, and say what is unknown.
+    const metaError = live?.metaWriteError ?? metaWriteErrors.get(gateway.id);
+    if (metaError) {
+      warnings.push(
+        `${gateway.id}: could not persist discovery metadata (${metaError}); ` +
+          `provenance and exclusion counts are unavailable for this lane`,
+      );
+    }
     if (info && ttlMs > 0 && Date.now() - info.syncedAt > ttlMs) {
       warnings.push(`${gateway.id}: catalog older than the ${Math.round(ttlMs / 3_600_000)}h refresh TTL`);
     }
@@ -1241,6 +1231,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           ...(info.litellmEnriched !== undefined ? { litellmEnriched: info.litellmEnriched } : {}),
           ...(info.maxTokensCappedCount !== undefined ? { maxTokensCappedCount: info.maxTokensCappedCount } : {}),
           ...(info.error ? { error: info.error } : {}),
+          ...(metaWriteErrors.get(id) ? { metaWriteError: metaWriteErrors.get(id) } : {}),
         });
         if (info.ok && info.status) {
           await recordDiscoveryMeta(id, info.status.modelCount, info.status);
