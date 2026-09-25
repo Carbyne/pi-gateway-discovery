@@ -14,6 +14,8 @@
  *   node --experimental-strip-types scripts/selftest.mjs
  */
 import assert from "node:assert/strict";
+import { join } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   declaredThinkingLevelMap,
   resolveQuirk,
@@ -21,12 +23,17 @@ import {
   unusableModelReason,
 } from "../src/quirks.ts";
 import { diffGatewayConfigs, fingerprintConfig, mergeGatewayConfigs, parseGatewayConfig } from "../src/config.ts";
+import { withTempAgentDir } from "./with-temp-agent-dir.mjs";
 
 let passed = 0;
 const failures = [];
-const test = (name, fn) => {
-  try { fn(); passed++; }
-  catch (error) { failures.push(`${name}\n    ${error.message.split("\n").slice(0, 3).join("\n    ")}`); }
+const tests = [];
+const test = (name, fn) => { tests.push({ name, fn }); };
+const runTests = async () => {
+  for (const { name, fn } of tests) {
+    try { await fn(); passed++; }
+    catch (error) { failures.push(`${name}\n    ${error.message.split("\n").slice(0, 3).join("\n    ")}`); }
+  }
 };
 const api = (id) => resolveQuirk(id)?.api;
 
@@ -248,7 +255,83 @@ test("normalizeBaseUrl trims the trailing slash that would double up in paths", 
   assert.equal(parsed.gateways[0].baseUrl, "https://e/v1");
 });
 
+console.log("concurrent persistence (race regression)");
+
+// These encode two defects that a sequential test cannot see, both of which
+// shipped once: a temp path built from `${pid}.${Date.now()}` that two
+// concurrent saves computed identically (the loser's rename then hit ENOENT),
+// and an unserialized whole-file read-modify-write where the last writer
+// silently deleted the other's key. Only the first throws; the second just
+// loses data, which is why both are asserted here.
+{
+  // withTempAgentDir() re-imports config.ts against a throwaway dir and throws
+  // if any of its path constants still resolve outside it. Do not replace this
+  // with a bare `import("../src/config.ts")`: an earlier version of this test
+  // did, and because config.ts was already loaded it wrote straight into the
+  // developer's real ~/.pi/agent.
+  const sandbox = await withTempAgentDir("gw-selftest");
+  const { saveDiscoveryMeta, loadDiscoveryMeta, saveConfig, loadConfig } = sandbox.config;
+
+  const lanes = 10;
+  await Promise.all(
+    Array.from({ length: lanes }, (_, i) =>
+      saveDiscoveryMeta(`lane-${i}`, { syncedAt: 1, modelCount: i })),
+  );
+  const many = Array.from({ length: 6 }, (_, i) => cfg([gw(`g${i}`)]));
+  await Promise.all(many.map((c) => saveConfig(c)));
+
+  // Observe everything BEFORE dispose(): test() bodies run lazily at the end,
+  // so anything touching the filesystem must be captured while it exists.
+  const saved = await loadDiscoveryMeta();
+  const strays = readdirSync(sandbox.dir).filter((f) => f.endsWith(".tmp"));
+  let reloaded;
+  let reloadError;
+  try {
+    reloaded = await loadConfig();
+  } catch (error) {
+    reloadError = String(error?.message ?? error);
+  }
+  const rawConfig = (() => {
+    try { return readFileSync(join(sandbox.dir, "gateway-discovery.json"), "utf8"); }
+    catch { return undefined; }
+  })();
+
+  test("concurrent saveDiscoveryMeta keeps every lane", () => {
+    assert.equal(Object.keys(saved).length, lanes, `got ${Object.keys(saved).length}`);
+    for (let i = 0; i < lanes; i++) assert.equal(saved[`lane-${i}`].modelCount, i);
+  });
+
+  test("concurrent saves leave no stray temp files", () => {
+    assert.deepEqual(strays, []);
+  });
+
+  // saveConfig is whole-file replacement, NOT a read-modify-write, so the
+  // correct invariant is not "all six merged" but "exactly one coherent writer
+  // won" — a torn or interleaved result would be the bug. Contrast with
+  // saveDiscoveryMeta above, which must merge and must not lose lanes.
+  test("concurrent saveConfig resolves to exactly one coherent writer", () => {
+    assert.equal(reloadError, undefined, `loadConfig threw: ${reloadError}`);
+    assert.equal(reloaded.gateways.length, 1, `got ${reloaded.gateways.length}`);
+    const winner = reloaded.gateways[0].id;
+    assert.ok(many.some((c) => c.gateways.length === 1 && c.gateways[0].id === winner),
+      `result ${winner} is not one of the six complete inputs (torn write?)`);
+  });
+
+  test("concurrent saveConfig never leaves a truncated or unparseable file", () => {
+    // The temp-file + rename dance exists precisely so a reader never observes
+    // a half-written file. Assert the bytes on disk parse as a full document.
+    assert.ok(rawConfig, "config file missing");
+    assert.doesNotThrow(() => JSON.parse(rawConfig));
+    const parsed = JSON.parse(rawConfig);
+    assert.equal(parsed.version, 1);
+    assert.equal(parsed.gateways.length, 1);
+  });
+
+  sandbox.dispose();
+}
+
 // --- report ---------------------------------------------------------------
+await runTests();
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length) {
   console.log("\nFAILURES:");

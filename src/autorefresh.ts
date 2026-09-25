@@ -22,7 +22,7 @@
 
 import { existsSync, readFileSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
-import { AUTH_PATH, CONFIG_PATH, MODELS_STORE_PATH, type GatewayConfig, type GatewayConfigFile } from "./config.ts";
+import { AUTH_PATH, CONFIG_PATH, MODELS_STORE_PATH, uniqueTempPath, type GatewayConfig, type GatewayConfigFile } from "./config.ts";
 import { discoverGateway, type GatewayDiscoveryStatus } from "./discovery.ts";
 
 export const AUTO_REFRESH_DEFAULT_TTL_HOURS = 1;
@@ -124,7 +124,11 @@ export function writeStoreEntry(providerId: string, models: unknown[]): void {
     // Store does not exist yet — create it.
   }
   current[providerId] = { models, checkedAt: Date.now() };
-  const tempPath = `${MODELS_STORE_PATH}.${process.pid}.${Date.now()}.tmp`;
+  // Synchronous by design: no await between read and rename, so writers in
+  // this process cannot interleave. A call-unique temp name still matters for
+  // the cross-process case (two pi sessions refreshing at the same moment),
+  // where `${pid}.${Date.now()}` collided and surfaced as a spurious ENOENT.
+  const tempPath = uniqueTempPath(MODELS_STORE_PATH);
   markSelfWrite();
   writeFileSync(tempPath, JSON.stringify(current, null, 2), { mode: 0o600 });
   renameSync(tempPath, MODELS_STORE_PATH);
