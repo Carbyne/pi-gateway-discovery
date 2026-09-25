@@ -55,7 +55,7 @@ export const MODEL_QUIRKS: readonly ModelQuirk[] = [
     note: "pro tier: reasoning cannot be disabled and only 'high' is a valid level",
   },
   {
-    match: /^gpt-5\.[2-9]-pro/u,
+    match: /^gpt-5\.(?:[2-9]|\d{2,})-pro/u,
     api: "openai-responses",
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: null },
     note: "pro tier: 'low' is rejected, minimum effort is 'medium'",

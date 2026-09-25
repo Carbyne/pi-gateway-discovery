@@ -109,6 +109,13 @@ export interface GatewayDiscoveryStatus {
   excludedUnusable?: Array<{ id: string; reason: string }>;
   /** Models whose protocol or thinking levels came from the quirk table. */
   quirksApplied?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  /**
+   * Quirks that would have applied but were suppressed by an explicit lane
+   * `api`. Reported rather than dropped quietly: an explicit lane setting wins
+   * (correct), but the resulting dead model otherwise looks like a backend bug
+   * rather than a rule the user overrode.
+   */
+  quirksSuppressed?: Array<{ id: string; note: string }>;
 }
 
 export interface GatewayDiscoveryResult {
@@ -773,6 +780,7 @@ export async function discoverGateway(
   const maxTokensCapped: NonNullable<GatewayDiscoveryStatus["maxTokensCapped"]> = [];
   const excludedUnusable: NonNullable<GatewayDiscoveryStatus["excludedUnusable"]> = [];
   const quirksApplied: NonNullable<GatewayDiscoveryStatus["quirksApplied"]> = [];
+  const quirksSuppressed: NonNullable<GatewayDiscoveryStatus["quirksSuppressed"]> = [];
   const seen = new Set<string>();
 
   for (const entry of entries) {
@@ -805,10 +813,19 @@ export async function discoverGateway(
     const notes: string[] = [];
     let source: "declared" | "quirk" | undefined;
 
-    if (quirk?.api && lane.apiSource !== "explicit" && !explicit?.api) {
-      mapped.model.api = quirk.api;
-      notes.push(...quirk.notes);
-      source = "quirk";
+    if (quirk?.api) {
+      if (lane.apiSource === "explicit" && !explicit?.api) {
+        quirksSuppressed.push({
+          id,
+          note: `would route to ${quirk.api} (${quirk.notes.join("; ")}), but this lane pins`
+            + ` "api": "${lane.api}" in config — pin the model instead with`
+            + ` modelOverrides["${id}"].api`,
+        });
+      } else if (!explicit?.api) {
+        mapped.model.api = quirk.api;
+        notes.push(...quirk.notes);
+        source = "quirk";
+      }
     }
 
     const levelMap = declared ?? quirk?.thinkingLevelMap;
@@ -849,6 +866,7 @@ export async function discoverGateway(
       ...(maxTokensCapped.length > 0 ? { maxTokensCapped } : {}),
       ...(excludedUnusable.length > 0 ? { excludedUnusable } : {}),
       ...(quirksApplied.length > 0 ? { quirksApplied } : {}),
+      ...(quirksSuppressed.length > 0 ? { quirksSuppressed } : {}),
     },
   };
 }

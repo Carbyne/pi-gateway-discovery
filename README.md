@@ -57,8 +57,28 @@ and `excludeUnusable: false` opts out entirely.
 - **API keys never live in the config file** (`~/.pi/agent/gateway-discovery.json`).
   They are stored by pi's `/login` in `auth.json` (0600) or read from an
   ambient env var (`apiKeyEnv`).
-- The `gateways` tool never accepts or exposes keys.
-- Config files are written atomically with `0600` permissions.
+- The `gateways` tool never **returns** a key in a tool result, so key material
+  cannot leak into the model's context or the session transcript that way.
+  Two operations do touch keys, both explicitly requested:
+  - `add` / `/gw add` accepts `apiToken`, which is written straight to
+    `auth.json`. Passing it on the command line means it is visible in the
+    session log and shell history — prefer `/login <id>`, which prompts masked
+    (`ctx.ui.input` has no secret mode; only the login interaction does).
+  - `/gw export --keys` embeds stored keys in the bundle for a private
+    migration. It is off by default, the file is written `0600`, and the result
+    warns that the file is now a secret. A plain `/gw export` contains no key
+    material and is safe to share or commit.
+- Config, model cache, and discovery metadata are written atomically with
+  `0600` permissions.
+
+Persisted under the agent dir:
+
+| File | Contents | Secret? |
+|---|---|---|
+| `gateway-discovery.json` | gateways, `api`, `compat`, `modelOverrides`, exclusions | no |
+| `auth.json` | pi's provider credentials (shared with built-in providers) | **yes** |
+| `models-store.json` | the discovered model cache (owned by pi) | no |
+| `gateway-discovery-meta.json` | per-gateway discovery record: what was auto-configured and by which layer, what was filtered as unusable, and which quirks were suppressed by an explicit `api`. Read-only reporting aid, so `describe`/`doctor` can explain provenance in a session that did not run discovery. | no |
 
 ## Installation
 

@@ -23,7 +23,7 @@
 import { existsSync, readFileSync, renameSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import { AUTH_PATH, CONFIG_PATH, MODELS_STORE_PATH, type GatewayConfig, type GatewayConfigFile } from "./config.ts";
-import { discoverGateway } from "./discovery.ts";
+import { discoverGateway, type GatewayDiscoveryStatus } from "./discovery.ts";
 
 export const AUTO_REFRESH_DEFAULT_TTL_HOURS = 1;
 /** Matches pi's own catalog-refresh timeout (RPC / interactive startup). */
@@ -154,6 +154,8 @@ export async function refreshStaleGateways(
       inferenceBaseUrl?: string;
       litellmEnriched?: boolean;
       maxTokensCappedCount?: number;
+      /** Full discovery status, so the caller can persist provenance metadata. */
+      status?: GatewayDiscoveryStatus;
       error?: string;
     },
   ) => void,
@@ -187,6 +189,7 @@ export async function refreshStaleGateways(
           ...(discovered.status.maxTokensCapped
             ? { maxTokensCappedCount: discovered.status.maxTokensCapped.length }
             : {}),
+          status: discovered.status,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

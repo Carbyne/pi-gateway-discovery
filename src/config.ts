@@ -88,6 +88,17 @@ export const CONFIG_PATH = join(AGENT_DIR, "gateway-discovery.json");
 export const AUTH_PATH = join(AGENT_DIR, "auth.json");
 export const MODELS_STORE_PATH = join(AGENT_DIR, "models-store.json");
 export const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
+/**
+ * Per-gateway discovery metadata that pi's model cache does not carry: which
+ * models were auto-configured and by which layer, which were suppressed, and
+ * which were filtered as unusable.
+ *
+ * Kept in its own file rather than inside `models-store.json` so pi keeps
+ * ownership of the model cache, and written next to each successful discovery.
+ * Without it, `describe` and `doctor` can only answer provenance in the one
+ * session that happened to run discovery — i.e. almost never.
+ */
+export const DISCOVERY_META_PATH = join(AGENT_DIR, "gateway-discovery-meta.json");
 
 export function isGatewayApi(value: unknown): value is GatewayApi {
   return value === "openai-completions" || value === "openai-responses" || value === "anthropic-messages";
@@ -271,6 +282,58 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
   });
 
   return { version: 1, ...(autoRefreshTtlHours !== undefined ? { autoRefreshTtlHours } : {}), gateways };
+}
+
+/** Discovery metadata keyed by gateway id; absence just means "not yet recorded". */
+export interface GatewayDiscoveryMeta {
+  syncedAt: number;
+  modelCount: number;
+  /** Inference base actually used, so `describe` is right in fresh sessions too. */
+  inferenceBaseUrl?: string;
+  excludedUnusable?: Array<{ id: string; reason: string }>;
+  quirksApplied?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  quirksSuppressed?: Array<{ id: string; note: string }>;
+}
+
+export async function loadDiscoveryMeta(): Promise<Record<string, GatewayDiscoveryMeta>> {
+  try {
+    const parsed = JSON.parse(await readFile(DISCOVERY_META_PATH, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, GatewayDiscoveryMeta>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read-modify-write one gateway's metadata. A whole-file rewrite would let two
+ * concurrent syncs clobber each other's entries, so the file is re-read here
+ * and only the one key is replaced.
+ */
+export async function saveDiscoveryMeta(
+  gatewayId: string,
+  meta: GatewayDiscoveryMeta,
+): Promise<void> {
+  const all = await loadDiscoveryMeta();
+  all[gatewayId] = meta;
+  await mkdir(dirname(DISCOVERY_META_PATH), { recursive: true });
+  const tempPath = `${DISCOVERY_META_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(tempPath, `${JSON.stringify(all, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(tempPath, DISCOVERY_META_PATH);
+    await chmod(DISCOVERY_META_PATH, 0o600);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}
+
+export async function deleteDiscoveryMeta(gatewayId: string): Promise<void> {
+  const all = await loadDiscoveryMeta();
+  if (!(gatewayId in all)) return;
+  delete all[gatewayId];
+  await writeFile(DISCOVERY_META_PATH, `${JSON.stringify(all, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 export async function loadConfig(): Promise<GatewayConfigFile> {

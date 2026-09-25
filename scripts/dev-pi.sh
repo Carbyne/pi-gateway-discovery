@@ -26,7 +26,7 @@ fi
 
 # --fresh: drop the derived catalog cache so discovery definitely re-runs.
 if [ "${1:-}" = "--fresh" ]; then
-  rm -f "$SANDBOX/models-store.json"
+  rm -f "$SANDBOX/models-store.json" "$SANDBOX/gateway-discovery-meta.json"
   shift
 fi
 

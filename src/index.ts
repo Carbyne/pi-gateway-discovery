@@ -44,22 +44,26 @@ import {
   AUTH_PATH,
   CONFIG_PATH,
   MODELS_STORE_PATH,
+  deleteDiscoveryMeta,
   deleteJsonRecordKey,
   diffGatewayConfigs,
   fingerprintConfig,
   inferenceBaseUrlForApi,
   isGatewayApi,
   loadConfig,
+  loadDiscoveryMeta,
   mergeGatewayConfigs,
   normalizeBaseUrl,
   parseGatewayConfig,
   saveConfig,
+  saveDiscoveryMeta,
   suggestGatewayIdentity,
   validateGatewayId,
   type ConfigDelta,
   type GatewayApi,
   type GatewayConfig,
   type GatewayConfigFile,
+  type GatewayDiscoveryMeta,
   type ModelOverride,
 } from "./config.ts";
 import {
@@ -76,7 +80,7 @@ import {
   ttlMsFromConfig,
 } from "./autorefresh.ts";
 import { readSettingsDefault } from "./config.ts";
-import { discoverGateway } from "./discovery.ts";
+import { discoverGateway, type GatewayDiscoveryStatus } from "./discovery.ts";
 import { existsSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve as resolvePath } from "node:path";
@@ -120,6 +124,82 @@ let loadedConfigFingerprint = "";
  * rather than letting `state: "ok"` imply everything is current.
  */
 const driftedGateways = new Set<string>();
+
+/** Mirror of gateway-discovery-meta.json, refreshed on load and on write. */
+let persistedMeta: Record<string, GatewayDiscoveryMeta> = {};
+
+interface DiscoveryMetaView {
+  syncedAt: number;
+  modelCount?: number;
+  inferenceBaseUrl?: string;
+  excludedUnusableDetail?: Array<{ id: string; reason: string }>;
+  quirksAppliedDetail?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  quirksSuppressed?: Array<{ id: string; note: string }>;
+  /** True when this came from disk rather than a discovery run in this session. */
+  persisted: boolean;
+}
+
+/**
+ * Discovery metadata for a gateway: prefer what this session observed, else
+ * fall back to the persisted record. Without the fallback, `describe` and
+ * `doctor` could not report provenance in a fresh session — which is the
+ * normal case, since discovery rarely runs in the session that asks.
+ */
+function discoveryMetaFor(gatewayId: string): DiscoveryMetaView | undefined {
+  const info = lastSync.get(gatewayId);
+  if (info?.ok) {
+    return {
+      syncedAt: info.syncedAt,
+      modelCount: info.modelCount,
+      inferenceBaseUrl: info.inferenceBaseUrl,
+      excludedUnusableDetail: info.excludedUnusableDetail,
+      quirksAppliedDetail: info.quirksAppliedDetail,
+      persisted: false,
+    };
+  }
+  const meta = persistedMeta[gatewayId];
+  if (!meta) return undefined;
+  return {
+    syncedAt: meta.syncedAt,
+    modelCount: meta.modelCount,
+    inferenceBaseUrl: meta.inferenceBaseUrl,
+    excludedUnusableDetail: meta.excludedUnusable,
+    quirksAppliedDetail: meta.quirksApplied,
+    quirksSuppressed: meta.quirksSuppressed,
+    persisted: true,
+  };
+}
+
+/**
+ * Persist the discovery record (provenance + exclusions) for a gateway.
+ *
+ * Both discovery paths must call this: the provider's `fetchModels` and the
+ * factory's `refreshStaleGateways`. The latter is what `pi --list-models` and
+ * `pi -p` use, so writing only from `fetchModels` silently produced no
+ * metadata in exactly the headless flows that bootstrap a new machine.
+ */
+async function recordDiscoveryMeta(
+  gatewayId: string,
+  modelCount: number,
+  status?: GatewayDiscoveryStatus,
+): Promise<void> {
+  const meta: GatewayDiscoveryMeta = {
+    syncedAt: Date.now(),
+    modelCount,
+    ...(status ? { inferenceBaseUrl: status.inferenceBaseUrl } : {}),
+    ...(status?.excludedUnusable ? { excludedUnusable: status.excludedUnusable } : {}),
+    ...(status?.quirksApplied ? { quirksApplied: status.quirksApplied } : {}),
+    ...(status?.quirksSuppressed ? { quirksSuppressed: status.quirksSuppressed } : {}),
+  };
+  persistedMeta = { ...persistedMeta, [gatewayId]: meta };
+  try {
+    await saveDiscoveryMeta(gatewayId, meta);
+  } catch (error) {
+    // Reporting data, not the catalog itself — but say so, rather than
+    // swallowing it: a silently missing file reads as "nothing was excluded".
+    console.error(`[gateway-discovery] could not persist discovery metadata for ${gatewayId}: ${errorMessage(error)}`);
+  }
+}
 
 /** Write config and keep the in-memory copy and its fingerprint in step. */
 async function persistConfig(next: GatewayConfigFile): Promise<void> {
@@ -344,6 +424,7 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
         // A successful re-discovery was derived from the current settings, so
         // any recorded drift is now resolved.
         driftedGateways.delete(gateway.id);
+        await recordDiscoveryMeta(gateway.id, result.status.modelCount, result.status);
         return result.models;
       } catch (error) {
         lastSync.set(gateway.id, { ok: false, syncedAt: Date.now(), error: errorMessage(error) });
@@ -515,6 +596,8 @@ async function removeGateway(
   await persistConfig({ version: 1, gateways: configFile.gateways.filter((gateway) => gateway.id !== gatewayId) });
   pi.unregisterProvider(gatewayId);
   lastSync.delete(gatewayId);
+  await deleteDiscoveryMeta(gatewayId);
+  delete persistedMeta[gatewayId];
   const cleanup = await cleanupGatewayState(gatewayId, ctx);
   await ctx.modelRegistry.refresh();
 
@@ -930,9 +1013,10 @@ export function doctorGateways(
     id: string;
     api: string;
     models: number;
-    excludedUnusable: number;
-    autoConfigured: number;
+    excludedUnusable: number | null;
+    autoConfigured: number | null;
     synced: string;
+    quirksSuppressed: Array<{ id: string; note: string }>;
     issues: string[];
   }>;
 } {
@@ -951,12 +1035,20 @@ export function doctorGateways(
 
   const ttlMs = ttlMsFromConfig(configFile);
   const gateways = configFile.gateways.map((gateway) => {
-    const info = lastSync.get(gateway.id);
+    const info = discoveryMetaFor(gateway.id);
     const models = all.filter((m) => m.provider === gateway.id);
     const issues: string[] = [];
 
-    if (!info) issues.push("never synced in this session");
-    else if (!info.ok) issues.push(`discovery failed: ${info.error ?? "unknown error"}`);
+    // A fresh session legitimately restores models from the cache without
+    // contacting the gateway, so "never synced here" is only a problem when
+    // nothing was restored — otherwise it is informational. Reporting it as a
+    // problem would make every healthy session look broken and teach users to
+    // ignore the output.
+    const live = lastSync.get(gateway.id);
+    if (!live) {
+      if (models.length === 0) issues.push("no models registered and never synced in this session");
+      else warnings.push(`${gateway.id}: using the cached catalog (${models.length} models); run /gw sync ${gateway.id} to re-discover`);
+    } else if (!live.ok) issues.push(`discovery failed: ${live.error ?? "unknown error"}`);
     else if (driftedGateways.has(gateway.id))
       issues.push(`config edited after this catalog was built (run /gw sync ${gateway.id})`);
 
@@ -967,10 +1059,10 @@ export function doctorGateways(
           : `no credential — run /login ${gateway.id} or set apiKeyEnv`,
       );
     }
-    if (info?.ok && models.length === 0) {
+    if (live?.ok && models.length === 0) {
       issues.push("catalog is empty — every model was filtered or excluded");
     }
-    if (info?.ok && ttlMs > 0 && Date.now() - info.syncedAt > ttlMs) {
+    if (info && ttlMs > 0 && Date.now() - info.syncedAt > ttlMs) {
       warnings.push(`${gateway.id}: catalog older than the ${Math.round(ttlMs / 3_600_000)}h refresh TTL`);
     }
 
@@ -979,9 +1071,13 @@ export function doctorGateways(
       id: gateway.id,
       api: gateway.api ?? "(negotiated)",
       models: models.length,
-      excludedUnusable: info?.excludedUnusableDetail?.length ?? 0,
-      autoConfigured: info?.quirksAppliedDetail?.length ?? 0,
-      synced: info?.ok ? ageMs(info.syncedAt) : "never",
+      // null means "no discovery record exists to answer from"; 0 means the
+      // record exists and says nothing was filtered. Collapsing the two would
+      // make a clean lane look like an unmeasured one.
+      excludedUnusable: info ? (info.excludedUnusableDetail?.length ?? 0) : null,
+      autoConfigured: info ? (info.quirksAppliedDetail?.length ?? 0) : null,
+      synced: info ? (info.persisted ? `${ageMs(info.syncedAt)} (from disk)` : ageMs(info.syncedAt)) : "never",
+      quirksSuppressed: info?.quirksSuppressed ?? [],
       issues,
     };
   });
@@ -1032,11 +1128,14 @@ function describeGateway(
   const gateway = configFile.gateways.find((g) => g.id === gatewayId);
   if (!gateway) throw new Error(`Unknown gateway: ${gatewayId}`);
 
-  const info = lastSync.get(gatewayId);
+  const meta = discoveryMetaFor(gatewayId);
   const all = ctx.modelRegistry.getAll().filter((m) => m.provider === gatewayId);
 
   const provenanceFor = (id: string): Record<string, unknown> => {
-    const applied = info?.quirksAppliedDetail?.find((q) => q.id === id);
+    // Must read the merged view: in a fresh session `lastSync` is empty and the
+    // provenance lives only in the persisted record, so consulting lastSync
+    // alone made every auto-configured value look like a pi-core default.
+    const applied = meta?.quirksAppliedDetail?.find((q) => q.id === id);
     const override = gateway.modelOverrides?.[id];
     return {
       api: override?.api ? "modelOverrides" : applied?.source === "quirk" ? "quirk-table" : gateway.api ? "gateway.api" : "negotiated-or-default",
@@ -1049,6 +1148,7 @@ function describeGateway(
             : "default (pi core clamping)",
       compat: override?.compat ? "modelOverrides" : gateway.compat ? "gateway.compat + defaults" : "defaults",
       note: applied?.note,
+      suppressed: meta?.quirksSuppressed?.find((q) => q.id === id)?.note,
     };
   };
 
@@ -1084,21 +1184,23 @@ function describeGateway(
     name: gateway.name,
     configuredBaseUrl: gateway.baseUrl,
     configuredApi: gateway.api ?? "(unset — negotiated)",
-    inferenceBaseUrl: info?.inferenceBaseUrl ?? inferenceBaseUrlForApi(gateway.baseUrl, gateway.api ?? "openai-completions"),
+    inferenceBaseUrl: meta?.inferenceBaseUrl ?? inferenceBaseUrlForApi(gateway.baseUrl, gateway.api ?? "openai-completions"),
     apiKeyEnv: gateway.apiKeyEnv ?? null,
     directHttpStreaming: gateway.directHttpStreaming ?? false,
     gatewayCompat: gateway.compat ?? null,
     modelOverrides: gateway.modelOverrides ? Object.keys(gateway.modelOverrides) : [],
     excludedModels: gateway.excludedModels ?? [],
     excludeUnusable: gateway.excludeUnusable !== false,
-    sync: info
+    sync: meta
       ? {
-          ok: info.ok,
-          models: info.modelCount,
-          excludedUnusable: info.excludedUnusableDetail ?? [],
-          autoConfigured: (info.quirksAppliedDetail ?? []).map((q) => ({ id: q.id, via: q.source, note: q.note })),
+          ok: true,
+          from: meta.persisted ? "persisted metadata" : "this session",
+          models: meta.modelCount,
+          excludedUnusable: meta.excludedUnusableDetail ?? [],
+          autoConfigured: (meta.quirksAppliedDetail ?? []).map((q) => ({ id: q.id, via: q.source, note: q.note })),
+          suppressedQuirks: meta.quirksSuppressed ?? [],
         }
-      : { ok: false, note: "never synced in this session" },
+      : { ok: false, note: "no discovery metadata recorded for this gateway" },
     registeredModels: all.map((m) => m.id),
   };
 }
@@ -1108,6 +1210,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   try {
     configFile = await loadConfig();
     loadedConfigFingerprint = fingerprintConfig(configFile);
+    persistedMeta = await loadDiscoveryMeta();
   } catch (error) {
     console.error(`[gateway-discovery] ${errorMessage(error)}`);
     return;
@@ -1127,7 +1230,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // `pi -p` — starts with a fresh model list. Fresh cache → zero delay.
   if (configFile.gateways.length > 0 && !isOffline()) {
     try {
-      await refreshStaleGateways(configFile, (id, info) => {
+      await refreshStaleGateways(configFile, async (id, info) => {
         lastSync.set(id, {
           ok: info.ok,
           syncedAt: Date.now(),
@@ -1139,6 +1242,9 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           ...(info.maxTokensCappedCount !== undefined ? { maxTokensCappedCount: info.maxTokensCappedCount } : {}),
           ...(info.error ? { error: info.error } : {}),
         });
+        if (info.ok && info.status) {
+          await recordDiscoveryMeta(id, info.status.modelCount, info.status);
+        }
       });
     } catch (error) {
       console.error(`[gateway-discovery] auto-refresh failed: ${errorMessage(error)}`);
