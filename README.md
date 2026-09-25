@@ -211,7 +211,27 @@ first:
    always win, so nothing here can contradict a deliberate choice.
 
 `/gw describe <id> <model>` reports the resolved values **and** which layer
-supplied them. Unusable families (embeddings, realtime, audio,
+supplied them.
+
+### Known limits of the quirk table
+
+The table is name-keyed, and that has two consequences worth stating rather
+than hiding:
+
+- **It trades precision for coverage.** A family prefix cannot express
+  sibling differences: on the deployment this table was built against,
+  `zai-glm-5`, `zai-glm-5-3` and `zai-glm-latest` accept `low|high|max`, while
+  `zai-glm-5-2` accepts every level. The rule gives 5-2 the restrictive map, so
+  a requested `medium` clamps to `high` — requests succeed, but not at the
+  chosen level. The fix is upstream declaration, not a per-model exception.
+- **It cannot know lifecycle facts.** A vendor retiring an id is invisible to a
+  name pattern. Where the list publishes `shutdown_date` these are filtered
+  correctly, but a backend whose `/models` carries no lifecycle field (the
+  Google OpenAI shim returns only `id`, `object`, `owned_by`, `display_name`)
+  will keep advertising retired models. Use `excludedModels` for those.
+
+Both are why layer 2 (upstream-declared metadata) outranks layer 3, and why
+`modelOverrides` remains the escape hatch rather than a sign of failure. Unusable families (embeddings, realtime, audio,
 completions-only) are dropped during discovery and listed with their reason in
 `/gw list` output and `gateways` tool status.
 

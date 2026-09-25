@@ -83,6 +83,17 @@ export const MODEL_QUIRKS: readonly ModelQuirk[] = [
   {
     // ZAI GLM fronted by a Mistral-style lane: a third, different vocabulary,
     // and omitting the parameter entirely is valid.
+    //
+    // KNOWN IMPRECISION: measured against this deployment, `zai-glm-5`,
+    // `zai-glm-5-3` and `zai-glm-latest` accept low|high|max, but
+    // `zai-glm-5-2` accepts all six levels. A family-prefix rule cannot model
+    // that, so 5-2 gets the restrictive map and a user's "medium" clamps to
+    // "high" — every request still succeeds, but the level is not what was
+    // asked for. This is the inherent cost of name-keyed knowledge: it trades
+    // precision for coverage. Do not special-case the sibling (that encodes one
+    // deployment); fix it properly by having the upstream declare
+    // `reasoning.supported_efforts`, which this layer already prefers, or pin
+    // the model via modelOverrides.
     match: /^zai-glm/u,
     thinkingLevelMap: { minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
     note: "GLM accepts reasoning_effort low|high|max; 'off' must omit the field",
