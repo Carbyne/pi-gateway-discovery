@@ -15,8 +15,9 @@
  */
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 const repoRoot = new URL("..", import.meta.url).pathname;
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import {
   declaredThinkingLevelMap,
   resolveQuirk,
@@ -440,6 +441,125 @@ console.log("sweep cost guard");
     assert.match(src, /opt\("yes-spend", false\) !== true/u, "guard must read parsed opts, not raw argv");
     assert.ok(!/argv\.push\(/u.test(src), "must not mutate argv while iterating it");
     assert.match(src, /TRANSIENT = new Set\(\[.*429/u, "429 must be treated as transient");
+  });
+}
+
+console.log("bundle fidelity: version stamp, settings, secret placement");
+
+{
+  const { bundleVersionWarning, findGitRoot } = await import(
+    `../src/config.ts?ver=${encodeURIComponent("t")}`
+  );
+
+  test("a bundle from a NEWER extension warns loudly", () => {
+    const w = bundleVersionWarning("0.3.0", "0.2.3");
+    assert.match(String(w), /0\.3\.0/u);
+    assert.match(String(w), /Update the extension/iu);
+  });
+
+  test("a bundle from an OLDER extension notes re-derivation, not a fault", () => {
+    const w = bundleVersionWarning("0.1.0", "0.2.3");
+    assert.match(String(w), /older/iu);
+    assert.doesNotMatch(String(w), /Update the extension/iu);
+  });
+
+  test("equal or unknown versions produce no warning", () => {
+    assert.equal(bundleVersionWarning("0.2.3", "0.2.3"), undefined);
+    assert.equal(bundleVersionWarning(undefined, "0.2.3"), undefined);
+    assert.equal(bundleVersionWarning("0.2.3", undefined), undefined);
+    assert.equal(bundleVersionWarning("nonsense", "0.2.3"), undefined);
+  });
+
+  test("findGitRoot finds the worktree and stops at the top", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gwgit-"));
+    const nested = join(dir, "a", "b");
+    mkdirSync(nested, { recursive: true });
+    assert.equal(findGitRoot(nested), undefined, "no .git anywhere -> undefined");
+    mkdirSync(join(dir, ".git"));
+    assert.equal(findGitRoot(nested), dir, "should find the ancestor .git");
+    rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+test("settings defaults are read and restored without clobbering", async () => {
+  const sandbox = await withTempAgentDir("gwsettings");
+  const { readSettingsDefaults, settingsHaveNoDefault, mergeSettingsDefaults } = sandbox.config;
+
+  writeFileSync(join(sandbox.dir, "settings.json"), JSON.stringify({ theme: "dark", keepMe: 42 }));
+  const empty = readSettingsDefaults();
+  assert.deepEqual(empty, {});
+  assert.equal(settingsHaveNoDefault(), true);
+
+  const written = await mergeSettingsDefaults({
+    defaultProvider: "acme", defaultModel: "acme/x", defaultThinkingLevel: "low",
+  });
+  assert.deepEqual(written.sort(), ["defaultModel", "defaultProvider", "defaultThinkingLevel"]);
+  assert.equal(settingsHaveNoDefault(), false);
+
+  // Unrelated keys must survive, and a second call must be a no-op.
+  const again = await mergeSettingsDefaults({ defaultProvider: "other" });
+  const data = JSON.parse(readFileSync(join(sandbox.dir, "settings.json"), "utf8"));
+  assert.equal(data.keepMe, 42, "unrelated settings must be preserved");
+  assert.equal(data.theme, "dark");
+  assert.equal(data.defaultProvider, "other");
+  assert.deepEqual(again, ["defaultProvider"]);
+  assert.deepEqual(await mergeSettingsDefaults({ defaultProvider: "other" }), [], "idempotent");
+
+  sandbox.dispose();
+});
+
+console.log("secret-in-repo guard (deterministic)");
+
+{
+  const mod = await import(`../src/config.ts?guard=${encodeURIComponent("t")}`);
+  const { assertSecretWriteAllowed, SECRET_IN_REPO_ENV } = mod;
+  const inRepo = () => "/home/x/project";
+  const noRepo = () => undefined;
+
+  test("key-less bundle may go anywhere, including a repo", () => {
+    assert.doesNotThrow(() => assertSecretWriteAllowed("/p/x.json", false, undefined, { findRoot: inRepo, env: {} }));
+  });
+
+  test("secrets outside a repo are allowed", () => {
+    assert.doesNotThrow(() => assertSecretWriteAllowed("/tmp/x.json", true, undefined, { findRoot: noRepo, env: {} }));
+  });
+
+  test("secrets inside a repo are refused", () => {
+    assert.throws(() => assertSecretWriteAllowed("/p/x.json", true, undefined, { findRoot: inRepo, env: {} }),
+      /Refusing to write a bundle containing API keys/u);
+  });
+
+  // This is the case an agent session actually reached: the model passed the
+  // boolean after being refused. The parameter alone must NOT be sufficient.
+  test("the tool parameter alone is NOT enough — env var also required", () => {
+    assert.throws(() => assertSecretWriteAllowed("/p/x.json", true, true, { findRoot: inRepo, env: {} }),
+      /env/iu);
+  });
+
+  test("parameter AND env var together allow it", () => {
+    assert.doesNotThrow(() =>
+      assertSecretWriteAllowed("/p/x.json", true, true, { findRoot: inRepo, env: { [SECRET_IN_REPO_ENV]: "1" } }));
+  });
+
+  test("env var alone is not enough (needs an explicit request)", () => {
+    assert.throws(() =>
+      assertSecretWriteAllowed("/p/x.json", true, undefined, { findRoot: inRepo, env: { [SECRET_IN_REPO_ENV]: "1" } }),
+      /Refusing/u);
+  });
+
+  test("a non-'1' env value does not enable the override", () => {
+    for (const v of ["0", "true", "", "yes"]) {
+      assert.throws(() =>
+        assertSecretWriteAllowed("/p/x.json", true, true, { findRoot: inRepo, env: { [SECRET_IN_REPO_ENV]: v } }),
+        /Refusing/u, `env='${v}' should not enable the override`);
+    }
+  });
+
+  test("exportBundle must route through the guard (not re-implement it inline)", () => {
+    const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    assert.match(src, /assertSecretWriteAllowed\(/u, "exportBundle no longer calls the shared guard");
+    assert.doesNotMatch(src, /if \(credentials && Object\.keys\(credentials\)\.length > 0 && !params\.allowSecretInRepo\)/u,
+      "the old inline check has crept back");
   });
 }
 

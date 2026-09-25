@@ -292,23 +292,52 @@ Choosing between those two stays a layer-2/3 decision.
 
 ## Moving a setup to another machine
 
-`/gw export` writes one file containing every gateway, its `compat`, its
-`modelOverrides`, and its exclusions. API keys are **not** included by default:
+`/gw export` writes one file containing every gateway with its `compat`,
+`modelOverrides` and exclusions, plus two things a minimal bundle needs to be
+reproducible at all:
+
+- **the extension version that produced it** — a bare config omits all the
+  tuning because current code derives it; importing the same file into an older
+  build silently yields the original broken state, so import warns when the
+  bundle is newer than the install
+- **the saved default provider/model/thinking level** — restored on import only
+  when the target has none, so it never overwrites a choice already made there
+  (pass `restoreSettings` / `--restore-settings` to force it)
+
+API keys are **not** included by default:
 
 ```sh
 # machine A
 /gw export ~/pi-gateways.json
 
 # machine B
-scp hostA:~/pi-gateways.json .
+pi install git:github.com/you/pi-gateway-discovery   # the code is not in the bundle
 /gw import ./pi-gateways.json
-/login <gatewayId>          # once per gateway that has no apiKeyEnv
+/login <gatewayId>                                    # once per gateway
+pi update --models                                    # free: rebuilds catalog + provenance
 ```
 
-`--keys` embeds stored credentials for a private migration — it writes them to
-the bundle and warns you, since that file becomes a secret. Import merges by
-gateway id (`--replace` adopts the bundle wholesale) and re-discovers only the
-gateways that actually changed.
+A bundle is config data, not the extension itself and not the catalog: the
+catalog and provenance regenerate from `GET /models`, but the package must be
+installed on the target or there is nothing to import into.
+
+`--keys` embeds stored credentials for a private migration. It writes them to
+the bundle, sets mode 0600, warns, and **refuses outright if the target path is
+inside a git worktree** — the default output location is the current directory,
+which in practice is a project checkout, and a secrets file there is one
+`git add .` away from being committed.
+
+Overriding that takes **both** the `allowSecretInRepo` parameter and
+`PI_GATEWAY_ALLOW_SECRETS_IN_REPO=1` in the environment. The second half exists
+because when the override was a single parameter, an agent session that hit the
+refusal simply retried with `allowSecretInRepo=true` and wrote the secret
+anyway — a control that whatever is reasoning in the context window can toggle
+is advisory, not a control. An out-of-band env var puts the decision with
+whoever configured the machine.
+
+To avoid repeating `/login` per gateway on a machine where several lanes share
+one key, give them the same `apiKeyEnv` name; the bundle carries that, so the
+secret is supplied once via the environment.
 
 ## Troubleshooting
 
@@ -331,6 +360,7 @@ up as `400 status code (no body)`.
 | A model you expect is missing | automatic unusable filter, or `excludedModels` | `gateways list` / `/gw describe` shows the reason; set `excludeUnusable: false` to keep it |
 | A model 404s with `has been deprecated` | vendor retired it after the list was built | add it to `excludedModels` (lists often still advertise it) |
 | A model 403s with "an admin must enable them" | org entitlement, not a capability | leave it: another tenant may use it. Exclude per-machine if noisy |
+| Imported bundle behaves worse than the source machine | the target runs an older extension, and a minimal bundle relies on auto-configuration it lacks | check the import warning; `pi update --extension …` then `pi update --models` |
 | Edited the JSON and `sync` reported success but nothing changed | provider held the config loaded at startup | fixed — config is reconciled before every operation; a stale catalog now shows `config-changed` with a `/gw sync` hint |
 | Tokens arrive all at once at the end | HTTP/1.1-only gateway buffering under `fetch` | `directHttpStreaming: true` |
 
