@@ -8,7 +8,7 @@
  */
 
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -570,20 +570,173 @@ export async function saveConfig(next: GatewayConfigFile): Promise<void> {
   await withPathLock(CONFIG_PATH, () => atomicWriteJson(CONFIG_PATH, next));
 }
 
+/** What a bundle needs to reproduce a working default selection. */
+export interface SettingsDefaults {
+  defaultProvider?: string;
+  defaultModel?: string;
+  defaultThinkingLevel?: string;
+}
+
 /** Read the user's default model from pi's settings (best-effort). */
 export function readSettingsDefault(): { provider: string; modelId: string } | undefined {
+  const d = readSettingsDefaults();
+  return d.defaultProvider && d.defaultModel
+    ? { provider: d.defaultProvider, modelId: d.defaultModel }
+    : undefined;
+}
+
+export function readSettingsDefaults(): SettingsDefaults {
   try {
-    const data = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
-      defaultProvider?: unknown;
-      defaultModel?: unknown;
-    };
-    if (typeof data.defaultProvider === "string" && typeof data.defaultModel === "string") {
-      return { provider: data.defaultProvider, modelId: data.defaultModel };
+    const data = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as Record<string, unknown>;
+    const out: SettingsDefaults = {};
+    for (const key of ["defaultProvider", "defaultModel", "defaultThinkingLevel"] as const) {
+      if (typeof data[key] === "string" && (data[key] as string).trim()) {
+        out[key] = data[key] as string;
+      }
     }
+    return out;
   } catch {
-    // No settings file (or unreadable) — no default.
+    return {};
+  }
+}
+
+/** True when the user has no saved default yet, so restoring one cannot stomp a choice. */
+export function settingsHaveNoDefault(): boolean {
+  const d = readSettingsDefaults();
+  return !d.defaultProvider && !d.defaultModel;
+}
+
+/**
+ * Merge default-model keys into settings.json, preserving every other key.
+ * Returns the keys actually written.
+ */
+export async function mergeSettingsDefaults(
+  defaults: SettingsDefaults,
+): Promise<string[]> {
+  const allowed = ["defaultProvider", "defaultModel", "defaultThinkingLevel"] as const;
+  const written: string[] = [];
+  await withPathLock(SETTINGS_PATH, async () => {
+    const data = await readJsonObjectFile(SETTINGS_PATH);
+    for (const key of allowed) {
+      const value = defaults[key];
+      if (typeof value !== "string" || !value) continue;
+      if (data[key] === value) continue;
+      data[key] = value;
+      written.push(key);
+    }
+    if (written.length > 0) await atomicWriteJson(SETTINGS_PATH, data);
+  });
+  return written;
+}
+
+/**
+ * The extension's own version, read from package.json next to the source tree.
+ * Recorded in bundles so an import can tell whether the *code* that derived a
+ * bare config is present on the target — see bundleVersionWarning().
+ */
+export function extensionVersion(): string | undefined {
+  for (const rel of ["../package.json", "../../package.json"]) {
+    try {
+      const parsed = JSON.parse(readFileSync(new URL(rel, import.meta.url), "utf8")) as {
+        name?: unknown;
+        version?: unknown;
+      };
+      if (parsed.name === "pi-gateway-discovery" && typeof parsed.version === "string") {
+        return parsed.version;
+      }
+    } catch {
+      // try next
+    }
   }
   return undefined;
+}
+
+function parseSemver(value: string): [number, number, number] | undefined {
+  const m = /^(\d+)\.(\d+)\.(\d+)/u.exec(value.trim());
+  if (!m) return undefined;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+/**
+ * Compare the version that produced a bundle against the one importing it.
+ *
+ * This matters because the config is deliberately minimal: on a current build
+ * the quirks table, gateway-safe compat defaults and lane negotiation supply
+ * everything a bare config omits. Import that same bare config into an OLDER
+ * build and none of that exists, so the user silently gets the original broken
+ * state — every gateway registered as openai-completions, every strict backend
+ * rejecting `store`. A 42-line file can therefore only be reproduced by code at
+ * least as new as the code that wrote it, and the bundle is the only place that
+ * fact can travel.
+ */
+export function bundleVersionWarning(
+  bundleVersion: string | undefined,
+  currentVersion: string | undefined,
+): string | undefined {
+  if (!bundleVersion || !currentVersion) return undefined;
+  const a = parseSemver(bundleVersion);
+  const b = parseSemver(currentVersion);
+  if (!a || !b) return undefined;
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) {
+      return a[i] > b[i]
+        ? `bundle was produced by pi-gateway-discovery ${bundleVersion}, but this install is ${currentVersion}: `
+          + `a minimal bundle relies on auto-configuration that may not exist in this version. Update the extension before importing.`
+        : `bundle came from an older pi-gateway-discovery (${bundleVersion} vs ${currentVersion}); `
+          + `current auto-configuration will re-derive settings, which is expected.`;
+    }
+  }
+  return undefined;
+}
+
+/** Environment variable that must be set, in addition to the tool parameter, to allow secrets in a repo. */
+export const SECRET_IN_REPO_ENV = "PI_GATEWAY_ALLOW_SECRETS_IN_REPO";
+
+/**
+ * Decide whether a credential-bearing bundle may be written to `target`.
+ *
+ * Extracted as a pure function with an injectable lookup because the decision
+ * is a security control and must be testable without an agent session: an
+ * end-to-end check through `pi -p` is non-deterministic, and in practice the
+ * model simply retried the refused call with `allowSecretInRepo=true` — which
+ * is exactly why the override now also requires an environment variable rather
+ * than being a parameter the caller in context can choose to set.
+ */
+export function assertSecretWriteAllowed(
+  target: string,
+  hasCredentials: boolean,
+  allowInRepo: boolean | undefined,
+  opts: { env?: Record<string, string | undefined>; findRoot?: (p: string) => string | undefined } = {},
+): void {
+  if (!hasCredentials) return;
+  const repo = (opts.findRoot ?? findGitRoot)(dirname(target));
+  if (!repo) return;
+  const envOverride = (opts.env ?? process.env)[SECRET_IN_REPO_ENV] === "1";
+  if (allowInRepo && envOverride) return;
+  throw new Error(
+    `Refusing to write a bundle containing API keys into a git worktree (${repo}). ` +
+      `Export without keys and run /login on the target, or choose a path outside a repository. ` +
+      `To override deliberately, set ${SECRET_IN_REPO_ENV}=1 in the environment` +
+      (allowInRepo ? " (the request already asked to override; the env var is still required)." : " and pass allowSecretInRepo."),
+  );
+}
+
+/**
+ * Nearest ancestor directory containing `.git`, if any.
+ * Used to refuse writing a credential-bearing bundle into a repository.
+ */
+export function findGitRoot(startPath: string): string | undefined {
+  let dir = startPath;
+  for (;;) {
+    try {
+      if (existsSync(join(dir, ".git"))) return dir;
+    } catch {
+      return undefined;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
 }
 
 /** Remove one key from a JSON object file, preserving unrelated entries (used for auth.json / models-store.json cleanup). */

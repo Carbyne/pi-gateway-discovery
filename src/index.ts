@@ -44,8 +44,12 @@ import {
   AUTH_PATH,
   CONFIG_PATH,
   MODELS_STORE_PATH,
+  assertSecretWriteAllowed,
+  bundleVersionWarning,
   deleteDiscoveryMeta,
   deleteJsonRecordKey,
+  extensionVersion,
+  findGitRoot,
   diffGatewayConfigs,
   fingerprintConfig,
   inferenceBaseUrlForApi,
@@ -53,7 +57,10 @@ import {
   loadConfig,
   loadDiscoveryMeta,
   mergeGatewayConfigs,
+  mergeSettingsDefaults,
   normalizeBaseUrl,
+  readSettingsDefaults,
+  settingsHaveNoDefault,
   parseGatewayConfig,
   saveConfig,
   saveDiscoveryMeta,
@@ -65,6 +72,7 @@ import {
   type GatewayConfig,
   type GatewayConfigFile,
   type GatewayDiscoveryMeta,
+  type SettingsDefaults,
   type ModelOverride,
 } from "./config.ts";
 import {
@@ -802,6 +810,14 @@ interface GatewayBundle {
   config: GatewayConfigFile;
   /** Present only when the export was explicitly asked to include keys. */
   credentials?: Record<string, string>;
+  /**
+   * Version of the extension that produced this bundle. A minimal bundle is
+   * only reproducible by code at least as new, because the missing tuning is
+   * supplied by auto-configuration rather than stored in the file.
+   */
+  extensionVersion?: string;
+  /** Saved default model, so a restored setup actually comes back selected. */
+  piSettings?: SettingsDefaults;
 }
 
 async function readStoredApiKeys(): Promise<Record<string, string>> {
@@ -836,6 +852,8 @@ interface ExportResult {
   gatewayIds: string[];
   credentialsIncluded: boolean;
   credentialProviders: string[];
+  extensionVersion?: string;
+  capturedDefault?: string;
   note: string;
 }
 
@@ -843,6 +861,7 @@ async function exportBundle(params: {
   path?: string;
   withKeys?: boolean;
   overwrite?: boolean;
+  allowSecretInRepo?: boolean;
 }): Promise<ExportResult> {
   if (!params.path) throw new Error("path is required for action=export");
   const target = resolvePath(params.path);
@@ -852,6 +871,24 @@ async function exportBundle(params: {
   if (configFile.gateways.length === 0) throw new Error("No gateways configured — nothing to export");
 
   const credentials = params.withKeys ? await readStoredApiKeys() : undefined;
+
+  // A key-less bundle is a shareable artifact; a --keys bundle is a secret.
+  // The default output path is the current directory, which in practice is a
+  // project checkout — so --keys would drop credentials where the next
+  // `git add .` picks them up.
+  //
+  // The override deliberately needs BOTH the tool parameter and an environment
+  // variable. When this was a single boolean, an agent session that hit the
+  // refusal simply retried with allowSecretInRepo=true and wrote the secret
+  // anyway, which makes the control advisory rather than a control. Requiring
+  // an out-of-band env var means the decision belongs to whoever configured the
+  // machine, not to whatever is reasoning in the context window.
+  assertSecretWriteAllowed(
+    target,
+    !!credentials && Object.keys(credentials).length > 0,
+    params.allowSecretInRepo,
+  );
+
   const bundle: GatewayBundle = {
     bundleVersion: 1,
     generatedBy: "pi-gateway-discovery",
@@ -859,6 +896,8 @@ async function exportBundle(params: {
     // Deep copy: exporting must not hand out references into live config.
     config: JSON.parse(JSON.stringify(configFile)) as GatewayConfigFile,
     ...(credentials && Object.keys(credentials).length > 0 ? { credentials } : {}),
+    extensionVersion: extensionVersion(),
+    piSettings: readSettingsDefaults(),
   };
 
   await mkdir(dirname(target), { recursive: true });
@@ -872,6 +911,10 @@ async function exportBundle(params: {
     gatewayIds: bundle.config.gateways.map((g) => g.id),
     credentialsIncluded: !!bundle.credentials,
     credentialProviders: bundle.credentials ? Object.keys(bundle.credentials) : [],
+    extensionVersion: bundle.extensionVersion,
+    capturedDefault: bundle.piSettings?.defaultModel
+      ? `${bundle.piSettings.defaultProvider ?? "?"}/${bundle.piSettings.defaultModel}`
+      : undefined,
     note: bundle.credentials
       ? "WARNING: this file contains API keys. Treat it as a secret; do not commit or paste it."
       : "API keys are not included. Run /login <gatewayId> after importing, or set apiKeyEnv per gateway.",
@@ -888,12 +931,14 @@ interface ImportResult {
   totalGateways: number;
   credentialsInstalled: string[];
   needsLogin: string[];
+  settingsRestored?: string[];
+  versionWarning?: string;
   note?: string;
 }
 
 async function importBundle(
   pi: ExtensionAPI,
-  params: { path?: string; mode?: string },
+  params: { path?: string; mode?: string; restoreSettings?: boolean },
   ctx: Pick<ExtensionCommandContext, "modelRegistry">,
 ): Promise<ImportResult> {
   if (!params.path) throw new Error("path is required for action=import");
@@ -910,6 +955,15 @@ async function importBundle(
   // Reuse the loader's validator: an import must be held to exactly the rules
   // the live config file is, or a bad bundle can reach the registry.
   const incoming = parseGatewayConfig(configInput);
+
+  // A minimal bundle is only reproducible by code at least as new as the code
+  // that wrote it: the tuning it omits is supplied by auto-configuration, so
+  // importing it into an older build silently yields the original broken
+  // state. Say so instead of letting the user debug a mystery.
+  const versionWarning = bundleVersionWarning(
+    typeof record.extensionVersion === "string" ? record.extensionVersion : undefined,
+    extensionVersion(),
+  );
 
   let credentialsInstalled: string[] = [];
   const creds = record.credentials;
@@ -956,6 +1010,19 @@ async function importBundle(
     .map((g) => g.id)
     .filter((id) => !credentialsInstalled.includes(id));
 
+  // Restore the saved default selection, but never over an explicit choice the
+  // target already made — only when it has none, or when asked.
+  const bundleSettings = record.piSettings;
+  let settingsRestored: string[] = [];
+  if (
+    bundleSettings
+    && typeof bundleSettings === "object"
+    && !Array.isArray(bundleSettings)
+    && (params.restoreSettings === true || settingsHaveNoDefault())
+  ) {
+    settingsRestored = await mergeSettingsDefaults(bundleSettings as SettingsDefaults);
+  }
+
   const imported: ImportResult = {
     from: target,
     mode,
@@ -966,6 +1033,8 @@ async function importBundle(
     totalGateways: next.gateways.length,
     credentialsInstalled,
     needsLogin: missingKeys,
+    ...(settingsRestored.length > 0 ? { settingsRestored } : {}),
+    ...(versionWarning ? { versionWarning } : {}),
     ...(missingKeys.length > 0 ? { note: `Run /login for: ${missingKeys.join(", ")}` } : {}),
   };
   return imported;
@@ -1356,10 +1425,12 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
               path: pathArg ?? "pi-gateways.json",
               withKeys: rest.includes("--keys"),
               overwrite: rest.includes("--force"),
+              allowSecretInRepo: rest.includes("--allow-in-repo"),
             });
             ctx.ui.notify(
               `Exported ${result.gateways} gateway(s) to ${result.path}`
                 + `${result.credentialsIncluded ? " INCLUDING API KEYS" : " (no API keys)"}`
+                + `${result.capturedDefault ? `\nSaved default captured: ${result.capturedDefault}` : ""}`
                 + `\n${result.note}`,
               result.credentialsIncluded ? "warning" : "info",
             );
@@ -1371,12 +1442,18 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           try {
             const pathArg = rest.find((t) => !t.startsWith("--"));
             if (!pathArg) throw new Error("Usage: /gw import <path> [--replace]");
-            const result = await importBundle(pi, { path: pathArg, mode: rest.includes("--replace") ? "replace" : "merge" }, ctx);
+            const result = await importBundle(pi, {
+              path: pathArg,
+              mode: rest.includes("--replace") ? "replace" : "merge",
+              restoreSettings: rest.includes("--restore-settings"),
+            }, ctx);
             ctx.ui.notify(
               `Imported ${result.totalGateways} gateway(s) from ${pathArg}: `
                 + `${result.added.length} added, ${result.updated.length} updated, ${result.removed.length} removed`
+                + `${result.settingsRestored?.length ? `\nRestored default: ${result.settingsRestored.join(", ")}` : ""}`
+                + `${result.versionWarning ? `\n\u26a0 ${result.versionWarning}` : ""}`
                 + `${result.needsLogin.length ? `\nNeeds /login: ${result.needsLogin.join(", ")}` : ""}`,
-              "info",
+              result.versionWarning ? "warning" : "info",
             );
           } catch (error) {
             ctx.ui.notify(errorMessage(error), "error");
@@ -1662,6 +1739,12 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       ),
       overwrite: Type.Optional(
         Type.Boolean({ description: "action=export only: replace an existing file at path" }),
+      ),
+      allowSecretInRepo: Type.Optional(
+        Type.Boolean({ description: "action=export only: permit a --keys bundle inside a git worktree. Off by default; a bundle with credentials is a secret and the default output path is usually a project checkout." }),
+      ),
+      restoreSettings: Type.Optional(
+        Type.Boolean({ description: "action=import only: also restore the saved default provider/model/thinking level. By default this happens only when the target has no default set, so it cannot overwrite an existing choice." }),
       ),
       mode: Type.Optional(
         Type.String({ description: "action=import only: 'merge' (default, upsert by gateway id) or 'replace' (adopt the bundle wholesale)" }),
