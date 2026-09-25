@@ -29,12 +29,15 @@ export interface ModelQuirk {
 
 /**
  * Models that refuse `tools` together with `reasoning_effort` on
- * `/chat/completions`, or that exist only on `/responses`. The gateway says so
- * explicitly ("... use /v1/responses"), but that is a runtime error you only
- * meet on first use — and a lane-wide `api` switch is the wrong fix when older
- * models on the same lane have no `/responses` equivalent.
+ * `/chat/completions`, or that exist only on `/responses`.
+ *
+ * Every alternative is anchored to an OpenAI model-name prefix. A pattern
+ * keyed on a bare suffix such as `-pro$` looks harmless until it silently
+ * rewrites `gemini-2.5-pro` on an unrelated lane and 404s it — a quirk table
+ * is only safe if each rule can name the vendor family it belongs to.
  */
-const NEEDS_RESPONSES = /^gpt-5\.(3-codex|4|5|6)|^gpt-6|^gpt-5-pro$|^o[13]-pro$|-pro(?:-20\d{2}-\d{2}-\d{2})?$/u;
+const NEEDS_RESPONSES =
+  /^(?:gpt-5\.(?:3-codex|4|5|6)|gpt-6|gpt-.*-pro|o\d[\d.]*-pro)/u;
 
 const LEVELS_NONE_HIGH = { off: "none", minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null };
 
@@ -56,6 +59,20 @@ export const MODEL_QUIRKS: readonly ModelQuirk[] = [
     api: "openai-responses",
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: "high", xhigh: "xhigh", max: null },
     note: "pro tier: 'low' is rejected, minimum effort is 'medium'",
+  },
+  {
+    // Legacy o-series pro tiers: reasoning cannot be disabled AND `minimal` is
+    // not a level, so `off` must map to null (which excludes it, letting pi
+    // clamp to `low`) rather than being left absent — pi core's /responses
+    // client would otherwise emit `reasoning: {effort: "none"}` and 400.
+    //
+    // Note the contrast with gpt-5.4+/gpt-6, which *do* accept "none":
+    // stamping off:null there is a regression, because pi then clamps a
+    // user's "off" up to `minimal`, which those models reject.
+    match: /^o\d[\d.]*-pro/u,
+    api: "openai-responses",
+    thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null },
+    note: "o-series pro tier: no 'none' and no 'minimal'; levels are low|medium|high",
   },
   {
     // Mistral's own API exposes two reasoning settings, not the OpenAI six.
@@ -99,14 +116,56 @@ const UNUSABLE_PATTERNS: Array<{ match: RegExp; reason: string }> = [
   { match: /(^|[/:._-])aqa([/:._-]|$)/u, reason: "answer-quality-assessment route, retired" },
 ];
 
-/** Returns the reason string when the id names a non-chat / unusable model. */
-export function unusableModelReason(id: string): string | undefined {
+/**
+ * Ids a pattern should be tested against.
+ *
+ * Gateways routinely namespace model ids (`yoda/mistral-medium-3.5`,
+ * `openai/gpt-5.5-pro`). A table anchored on the bare model name would
+ * silently never fire on those lanes — it looks like "no quirk applies" rather
+ * than a matching bug — so every rule tests both the full id and the segment
+ * after the last slash.
+ */
+function idCandidates(id: string): string[] {
   const normalized = id.toLowerCase();
-  return UNUSABLE_PATTERNS.find((p) => p.match.test(normalized))?.reason;
+  const bare = normalized.includes("/")
+    ? normalized.slice(normalized.lastIndexOf("/") + 1)
+    : normalized;
+  return bare === normalized ? [normalized] : [normalized, bare];
 }
 
-/** First matching quirk for a model id, or undefined. */
-export function findQuirk(id: string): ModelQuirk | undefined {
-  const normalized = id.toLowerCase();
-  return MODEL_QUIRKS.find((q) => q.match.test(normalized));
+/** Returns the reason string when the id names a non-chat / unusable model. */
+export function unusableModelReason(id: string): string | undefined {
+  const candidates = idCandidates(id);
+  return UNUSABLE_PATTERNS.find((p) => candidates.some((c) => p.match.test(c)))?.reason;
+}
+
+export interface ResolvedQuirk {
+  api?: GatewayApi;
+  thinkingLevelMap?: Record<string, string | null>;
+  notes: string[];
+}
+
+/**
+ * Merge *every* matching quirk, later table entries winning per field.
+ *
+ * Returning only the first match is a trap: the broad "needs /responses"
+ * rule necessarily precedes the narrow "this pro tier only accepts high"
+ * rule, so first-match-wins lets the broad one claim the model and the
+ * narrow one's vocabulary never applies — which surfaces as an unrelated
+ * 400 about `reasoning_effort`, not as a table bug.
+ */
+export function resolveQuirk(id: string): ResolvedQuirk | undefined {
+  const candidates = idCandidates(id);
+  const matched = MODEL_QUIRKS.filter((q) => candidates.some((c) => q.match.test(c)));
+  if (matched.length === 0) return undefined;
+
+  const resolved: ResolvedQuirk = { notes: [] };
+  for (const q of matched) {
+    if (q.api) resolved.api = q.api;
+    if (q.thinkingLevelMap) {
+      resolved.thinkingLevelMap = { ...resolved.thinkingLevelMap, ...q.thinkingLevelMap };
+    }
+    resolved.notes.push(q.note);
+  }
+  return resolved;
 }

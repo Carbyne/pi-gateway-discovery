@@ -90,6 +90,74 @@ for (const [gw, re, expect] of VOCAB) {
     bad.length === 0, `${ms.length - bad.length}/${ms.length}${bad.length ? ` e.g. ${bad[0].id}` : ""}`);
 }
 
+// --- R6: quirk rules must not leak across vendors ------------------------
+// A name-keyed table is only safe if a rule cannot fire on another vendor's
+// model. `gemini-2.5-pro` matching a bare `-pro$` rule 404s it on a lane that
+// has no /responses surface at all.
+{
+  const openAiFamily = /^(gpt-|o\d[\d.]*(-|$))/u;
+  const leaked = models.filter((m) => m.api === "openai-responses" && !openAiFamily.test(m.id));
+  check("R6 no non-OpenAI model routed to openai-responses", leaked.length === 0,
+    leaked.length ? `leaked: ${leaked.map((m) => `${m.gw}/${m.id}`).join(", ")}` : "");
+}
+
+// --- R7: "off" must be handled per family, never blanket-stamped ---------
+// pi core's /responses client emits `reasoning: {effort:"none"}` unless
+// thinkingLevelMap.off is explicitly null. Some models reject "none" (o-series
+// pro) and need off:null; others *accept* "none" and are broken by off:null,
+// because pi then clamps a user's "off" up to `minimal`, which they reject.
+// Both directions are asserted so neither default can silently regress.
+{
+  const acceptsNone = of("yoda-openai").filter((m) =>
+    /^(gpt-5\.[4-9]|gpt-6)/u.test(m.id) && !/-pro/u.test(m.id) && m.api === "openai-responses");
+  const wronglyNull = acceptsNone.filter((m) => m.thinkingLevelMap?.off === null);
+  check("R7 gpt-5.4+/gpt-6 keep off usable (they accept effort 'none')",
+    acceptsNone.length > 0 && wronglyNull.length === 0,
+    `${acceptsNone.length - wronglyNull.length}/${acceptsNone.length}${wronglyNull.length ? ` e.g. ${wronglyNull[0].id}` : ""}`);
+
+  const oPro = of("yoda-openai").filter((m) => /^o\d[\d.]*-pro/u.test(m.id));
+  const badOPro = oPro.filter((m) => m.thinkingLevelMap?.off !== null || m.thinkingLevelMap?.minimal !== null);
+  check("R7 o-series pro set off:null and minimal:null (they reject 'none' and 'minimal')",
+    oPro.length > 0 && badOPro.length === 0,
+    `${oPro.length - badOPro.length}/${oPro.length}`);
+}
+
+// --- R8: narrow rules must survive the broad rule (merge, not first-match) ---
+{
+  const p5 = of("yoda-openai").filter((m) => /^gpt-5-pro/u.test(m.id));
+  check("R8 gpt-5-pro keeps its 'high'-only vocabulary despite NEEDS_RESPONSES",
+    p5.length > 0 && p5.every((m) => m.thinkingLevelMap?.low === null && m.thinkingLevelMap?.high === "high"),
+    `${p5.filter((m) => m.thinkingLevelMap?.low === null).length}/${p5.length}`);
+  const p52 = of("yoda-openai").filter((m) => /^gpt-5\.[2-9]-pro/u.test(m.id));
+  check("R8 gpt-5.x-pro keeps medium/high/xhigh",
+    p52.length > 0 && p52.every((m) => m.thinkingLevelMap?.low === null && m.thinkingLevelMap?.medium === "medium"),
+    `${p52.filter((m) => m.thinkingLevelMap?.medium === "medium").length}/${p52.length}`);
+}
+
+// --- R9: upstream-declared vocabulary must beat a name guess -------------
+// `yoda/qwen3.8-flash` publishes supported_efforts [xhigh, medium, low, none].
+// Nothing in the quirk table matches that id, so a correct map here can only
+// come from reading the field — and it proves declared > quirk precedence.
+{
+  const q = of("yoda-kyber").find((m) => /qwen/u.test(m.id));
+  const tlm = q?.thinkingLevelMap;
+  const ok = !!tlm && tlm.low === "low" && tlm.medium === "medium" && tlm.xhigh === "xhigh"
+    && tlm.high === null && tlm.max === null && tlm.off === "none";
+  check("R9 declared supported_efforts honoured (kyber qwen)", ok,
+    tlm ? JSON.stringify(tlm) : "no thinkingLevelMap");
+}
+
+// --- R10: rules must fire on vendor-namespaced ids -----------------------
+// `yoda/mistral-medium-3.5` is the same model as bare `mistral-medium-3.5`;
+// anchoring on the bare name makes the rule silently no-op on namespaced lanes.
+{
+  const m = of("yoda-kyber").find((x) => /mistral-medium/u.test(x.id));
+  const ok = !!m?.thinkingLevelMap && m.thinkingLevelMap.low === null
+    && m.thinkingLevelMap.high === "high" && m.thinkingLevelMap.off === "none";
+  check("R10 quirk fires through a 'yoda/' id prefix", ok,
+    m ? JSON.stringify(m.thinkingLevelMap) : "model not registered");
+}
+
 // --- report ---------------------------------------------------------------
 const width = Math.max(...[...pass, ...fail].map((s) => s.length), 10);
 console.log(`\nEffective-config acceptance check (${STORE})`);

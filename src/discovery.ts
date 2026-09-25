@@ -108,7 +108,7 @@ export interface GatewayDiscoveryStatus {
    */
   excludedUnusable?: Array<{ id: string; reason: string }>;
   /** Models whose protocol or thinking levels came from the quirk table. */
-  quirksApplied?: Array<{ id: string; note: string }>;
+  quirksApplied?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
 }
 
 export interface GatewayDiscoveryResult {
@@ -195,7 +195,7 @@ async function fetchJson(
 }
 
 import {
-  findQuirk,
+  resolveQuirk,
   unusableModelReason,
 } from "./quirks.ts";
 
@@ -520,11 +520,66 @@ function isNonChatModel(id: string): boolean {
   );
 }
 
+/**
+ * Effort vocabulary declared by the model list itself.
+ *
+ * vLLM / InferHub-style upstreams publish `reasoning.supported_efforts`. When
+ * present it is authoritative and must beat every name-based guess, because
+ * the vocabulary is a property of *this served checkpoint on this backend*
+ * rather than of the model family: the same `mistral-medium` name answers
+ * `none|high` on one deployment and the full OpenAI set on another. It is
+ * also free — the field is already in the payload we fetched.
+ *
+ * Not universal: on this gateway only one lane's entries carry it, so the
+ * quirk table remains the fallback where the upstream says nothing.
+ */
+export function declaredThinkingLevelMap(entry: RawEntry): Record<string, string | null> | undefined {
+  const reasoning = asRecord(entry.reasoning);
+  const raw = reasoning?.supported_efforts;
+  if (!Array.isArray(raw)) return undefined;
+  const supported = new Set(
+    raw.filter((v): v is string => typeof v === "string").map((v) => v.toLowerCase()),
+  );
+  if (supported.size === 0) return undefined;
+
+  const map: Record<string, string | null> = {};
+  // "off" is only honoured when the backend accepts an explicit "none"; a null
+  // here makes pi clamp a user's "off" to the cheapest real level instead of
+  // sending a value the backend rejects.
+  map.off = supported.has("none") ? "none" : null;
+  for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
+    map[level] = supported.has(level) ? level : null;
+  }
+  return map;
+}
+
 interface MappedModel {
   model: Model<Api>;
   source: string; // "builtin:provider/id" | "gateway"
   /** Set when the advertised output ceiling was capped (see FULL_WINDOW cap). */
   maxTokensCapped?: { reported: number };
+}
+
+/**
+ * A model the upstream has already switched off.
+ *
+ * Several OpenAI-compatible `/models` payloads carry `shutdown_date`. It is
+ * compared against *now* rather than treated as "has a shutdown date": a
+ * scheduled future retirement is a warning, not grounds for hiding a working
+ * model (a lane here lists `o3-mini` with a future date and it serves fine).
+ *
+ * Preferred to a hard-coded list of retired ids, which rots the moment the
+ * vendor retires another one — and free, since the field is already in the
+ * list we fetched. Not complete on its own: some retired ids ship a null
+ * `shutdown_date`, which is why the name-based capability table is retained
+ * alongside it.
+ */
+export function retiredModelReason(entry: RawEntry, now: number = Date.now()): string | undefined {
+  const raw = entry.shutdown_date ?? asRecord(entry.capabilities)?.shutdown_date;
+  if (typeof raw !== "string" && typeof raw !== "number") return undefined;
+  const at = typeof raw === "number" ? raw : Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  return at <= now ? `retired — shut down on ${raw}` : undefined;
 }
 
 function mapGatewayModel(
@@ -804,7 +859,7 @@ export async function discoverGateway(
         ? undefined
         : isNonChatModel(id)
           ? "non-chat model (embedding/audio/image/etc.)"
-          : unusableModelReason(id);
+          : unusableModelReason(id) ?? retiredModelReason(entry);
     if (unusable) {
       excludedUnusable.push({ id, reason: unusable });
       continue;
@@ -814,22 +869,32 @@ export async function discoverGateway(
     const mapped = mapGatewayModel(gateway, id, entry, info, api, inferenceBaseUrl);
     if (!mapped) continue;
 
-    // Quirk table: protocol + thinking-level vocabulary, applied beneath any
-    // value the user set explicitly (gateway.api / modelOverrides win).
-    const quirk = findQuirk(id);
-    if (quirk) {
-      const explicit = gateway.modelOverrides?.[id];
-      let applied = false;
-      if (quirk.api && lane.apiSource !== "explicit" && !explicit?.api) {
-        mapped.model.api = quirk.api;
-        applied = true;
-      }
-      if (quirk.thinkingLevelMap && !explicit?.thinkingLevelMap) {
-        mapped.model.thinkingLevelMap = { ...quirk.thinkingLevelMap };
-        applied = true;
-      }
-      if (applied) quirksApplied.push({ id, note: quirk.note });
+    // Protocol + thinking levels, in priority order:
+    //   modelOverrides > upstream-declared vocabulary > quirk table > defaults
+    const quirk = resolveQuirk(id);
+    const declared = declaredThinkingLevelMap(entry);
+    const explicit = gateway.modelOverrides?.[id];
+    const notes: string[] = [];
+    let source: "declared" | "quirk" | undefined;
+
+    if (quirk?.api && lane.apiSource !== "explicit" && !explicit?.api) {
+      mapped.model.api = quirk.api;
+      notes.push(...quirk.notes);
+      source = "quirk";
     }
+
+    const levelMap = declared ?? quirk?.thinkingLevelMap;
+    if (levelMap && !explicit?.thinkingLevelMap) {
+      mapped.model.thinkingLevelMap = { ...levelMap };
+      source = declared ? "declared" : "quirk";
+      notes.push(
+        declared
+          ? `vocabulary declared by upstream: ${JSON.stringify(levelMap)}`
+          : quirk?.notes.join("; ") ?? "",
+      );
+    }
+
+    if (source) quirksApplied.push({ id, note: notes.filter(Boolean).join("; "), source });
 
     models.push(mapped.model);
     if (mapped.maxTokensCapped) {
