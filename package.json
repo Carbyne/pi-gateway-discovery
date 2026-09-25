@@ -17,7 +17,10 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings scripts/selftest.mjs",
+    "verify": "node scripts/verify.mjs",
+    "sweep": "node scripts/sweep.mjs"
   },
   "keywords": [
     "pi-package",

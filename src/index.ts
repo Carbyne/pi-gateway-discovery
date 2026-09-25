@@ -44,16 +44,26 @@ import {
   AUTH_PATH,
   CONFIG_PATH,
   MODELS_STORE_PATH,
+  deleteDiscoveryMeta,
   deleteJsonRecordKey,
+  diffGatewayConfigs,
+  fingerprintConfig,
   inferenceBaseUrlForApi,
+  isGatewayApi,
   loadConfig,
+  loadDiscoveryMeta,
+  mergeGatewayConfigs,
   normalizeBaseUrl,
+  parseGatewayConfig,
   saveConfig,
+  saveDiscoveryMeta,
   suggestGatewayIdentity,
   validateGatewayId,
+  type ConfigDelta,
   type GatewayApi,
   type GatewayConfig,
   type GatewayConfigFile,
+  type GatewayDiscoveryMeta,
   type ModelOverride,
 } from "./config.ts";
 import {
@@ -65,12 +75,15 @@ import {
   refreshStaleGateways,
   staleGatewayIds,
   startStoreWatcher,
+  startConfigWatcher,
+  resolveGatewayKey,
   ttlMsFromConfig,
 } from "./autorefresh.ts";
 import { readSettingsDefault } from "./config.ts";
-import { discoverGateway } from "./discovery.ts";
+import { discoverGateway, type GatewayDiscoveryStatus } from "./discovery.ts";
+import { existsSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve as resolvePath } from "node:path";
 import { chmod, rename, rm } from "node:fs/promises";
 import { nodeHttpFetch } from "./streaming-fetch.ts";
 
@@ -90,10 +103,158 @@ interface SyncInfo {
   unhealthyEndpoints?: number;
   litellmEnriched?: boolean;
   maxTokensCappedCount?: number;
+  excludedUnusableCount?: number;
+  quirksAppliedCount?: number;
+  /** Which models were auto-configured, and where each setting came from. */
+  quirksAppliedDetail?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  excludedUnusableDetail?: Array<{ id: string; reason: string }>;
+  /** Protocol actually used, and whether config or negotiation chose it. */
+  api?: GatewayApi;
+  apiSource?: "explicit" | "negotiated";
   error?: string;
 }
 
 let configFile: GatewayConfigFile = { version: 1, gateways: [] };
+/** Fingerprint of `configFile` as last read from disk. */
+let loadedConfigFingerprint = "";
+/**
+ * Gateways whose on-disk config changed since their last successful sync.
+ * The provider has been re-registered, so new requests use the new settings,
+ * but the cached catalog was derived from the old ones — worth saying out loud
+ * rather than letting `state: "ok"` imply everything is current.
+ */
+const driftedGateways = new Set<string>();
+
+/** Mirror of gateway-discovery-meta.json, refreshed on load and on write. */
+let persistedMeta: Record<string, GatewayDiscoveryMeta> = {};
+
+interface DiscoveryMetaView {
+  syncedAt: number;
+  modelCount?: number;
+  inferenceBaseUrl?: string;
+  excludedUnusableDetail?: Array<{ id: string; reason: string }>;
+  quirksAppliedDetail?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  quirksSuppressed?: Array<{ id: string; note: string }>;
+  /** True when this came from disk rather than a discovery run in this session. */
+  persisted: boolean;
+}
+
+/**
+ * Discovery metadata for a gateway: prefer what this session observed, else
+ * fall back to the persisted record. Without the fallback, `describe` and
+ * `doctor` could not report provenance in a fresh session — which is the
+ * normal case, since discovery rarely runs in the session that asks.
+ */
+function discoveryMetaFor(gatewayId: string): DiscoveryMetaView | undefined {
+  const info = lastSync.get(gatewayId);
+  if (info?.ok) {
+    return {
+      syncedAt: info.syncedAt,
+      modelCount: info.modelCount,
+      inferenceBaseUrl: info.inferenceBaseUrl,
+      excludedUnusableDetail: info.excludedUnusableDetail,
+      quirksAppliedDetail: info.quirksAppliedDetail,
+      persisted: false,
+    };
+  }
+  const meta = persistedMeta[gatewayId];
+  if (!meta) return undefined;
+  return {
+    syncedAt: meta.syncedAt,
+    modelCount: meta.modelCount,
+    inferenceBaseUrl: meta.inferenceBaseUrl,
+    excludedUnusableDetail: meta.excludedUnusable,
+    quirksAppliedDetail: meta.quirksApplied,
+    quirksSuppressed: meta.quirksSuppressed,
+    persisted: true,
+  };
+}
+
+/**
+ * Persist the discovery record (provenance + exclusions) for a gateway.
+ *
+ * Both discovery paths must call this: the provider's `fetchModels` and the
+ * factory's `refreshStaleGateways`. The latter is what `pi --list-models` and
+ * `pi -p` use, so writing only from `fetchModels` silently produced no
+ * metadata in exactly the headless flows that bootstrap a new machine.
+ */
+async function recordDiscoveryMeta(
+  gatewayId: string,
+  modelCount: number,
+  status?: GatewayDiscoveryStatus,
+): Promise<void> {
+  const meta: GatewayDiscoveryMeta = {
+    syncedAt: Date.now(),
+    modelCount,
+    ...(status ? { inferenceBaseUrl: status.inferenceBaseUrl } : {}),
+    ...(status?.excludedUnusable ? { excludedUnusable: status.excludedUnusable } : {}),
+    ...(status?.quirksApplied ? { quirksApplied: status.quirksApplied } : {}),
+    ...(status?.quirksSuppressed ? { quirksSuppressed: status.quirksSuppressed } : {}),
+  };
+  persistedMeta = { ...persistedMeta, [gatewayId]: meta };
+  try {
+    await saveDiscoveryMeta(gatewayId, meta);
+  } catch (error) {
+    // Reporting data, not the catalog itself — but say so, rather than
+    // swallowing it: a silently missing file reads as "nothing was excluded".
+    console.error(`[gateway-discovery] could not persist discovery metadata for ${gatewayId}: ${errorMessage(error)}`);
+  }
+}
+
+/** Write config and keep the in-memory copy and its fingerprint in step. */
+async function persistConfig(next: GatewayConfigFile): Promise<void> {
+  configFile = next;
+  loadedConfigFingerprint = fingerprintConfig(next);
+  await saveConfig(next);
+}
+
+/**
+ * Reconcile the in-memory config with what is on disk.
+ *
+ * `configFile` is loaded once at extension start and each provider closes over
+ * its own `GatewayConfig`, so a hand-edit (or another session's `/gw` call)
+ * otherwise leaves `sync` re-deriving models from stale settings while still
+ * reporting success. Call this at the top of every operation that reads
+ * `configFile`; it is a no-op when nothing changed.
+ *
+ * Never throws: a half-written file must not break an otherwise healthy
+ * session, so on any read/parse failure the in-memory config is kept.
+ */
+async function ensureConfigCurrent(
+  pi: ExtensionAPI,
+  ctx: Pick<ExtensionCommandContext, "modelRegistry">,
+): Promise<ConfigDelta | undefined> {
+  let fresh: GatewayConfigFile;
+  try {
+    fresh = await loadConfig();
+  } catch {
+    return undefined;
+  }
+  const fingerprint = fingerprintConfig(fresh);
+  if (fingerprint === loadedConfigFingerprint) return undefined;
+
+  const delta = diffGatewayConfigs(configFile, fresh);
+  configFile = fresh;
+  loadedConfigFingerprint = fingerprint;
+
+  for (const id of delta.removed) {
+    try {
+      pi.unregisterProvider(id);
+    } catch {
+      // Already gone.
+    }
+    lastSync.delete(id);
+    driftedGateways.delete(id);
+  }
+  for (const id of [...delta.added, ...delta.modified]) {
+    const gateway = fresh.gateways.find((candidate) => candidate.id === id);
+    if (!gateway) continue;
+    pi.registerProvider(makeProvider(gateway));
+    // Cached models came from the previous settings; mark for re-discovery.
+    driftedGateways.add(id);
+  }
+  return delta.changed ? delta : undefined;
+}
 const lastSync = new Map<string, SyncInfo>();
 
 function wrapStreams(gateway: GatewayConfig, streams: ProviderStreams): ProviderStreams {
@@ -245,10 +406,25 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
           healthyEndpoints: result.status.healthyEndpoints,
           unhealthyEndpoints: result.status.unhealthyEndpoints,
           litellmEnriched: result.status.litellmEnriched,
+          api: result.status.api,
+          apiSource: result.status.apiSource,
           ...(result.status.maxTokensCapped
             ? { maxTokensCappedCount: result.status.maxTokensCapped.length }
             : {}),
+          ...(result.status.excludedUnusable
+            ? { excludedUnusableCount: result.status.excludedUnusable.length }
+            : {}),
+          ...(result.status.quirksApplied
+            ? { quirksAppliedCount: result.status.quirksApplied.length, quirksAppliedDetail: result.status.quirksApplied }
+            : {}),
+          ...(result.status.excludedUnusable
+            ? { excludedUnusableDetail: result.status.excludedUnusable }
+            : {}),
         });
+        // A successful re-discovery was derived from the current settings, so
+        // any recorded drift is now resolved.
+        driftedGateways.delete(gateway.id);
+        await recordDiscoveryMeta(gateway.id, result.status.modelCount, result.status);
         return result.models;
       } catch (error) {
         lastSync.set(gateway.id, { ok: false, syncedAt: Date.now(), error: errorMessage(error) });
@@ -269,8 +445,7 @@ async function saveAndRegister(
 ): Promise<void> {
   const replacing = configFile.gateways.some((g) => g.id === gateway.id);
   const gateways = configFile.gateways.filter((g) => g.id !== gateway.id);
-  configFile = { version: 1, gateways: [...gateways, gateway].sort((a, b) => a.id.localeCompare(b.id)) };
-  await saveConfig(configFile);
+  await persistConfig({ version: 1, gateways: [...gateways, gateway].sort((a, b) => a.id.localeCompare(b.id)) });
 
   if (replacing) pi.unregisterProvider(gateway.id);
   pi.registerProvider(makeProvider(gateway));
@@ -329,10 +504,22 @@ async function cleanupGatewayState(
 
 async function addGateway(
   pi: ExtensionAPI,
-  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; apiToken?: string; compat?: Record<string, unknown>; directHttpStreaming?: boolean },
+  params: { baseUrl?: string; gatewayId?: string; displayName?: string; apiKeyEnv?: string; apiToken?: string; api?: string; compat?: Record<string, unknown>; directHttpStreaming?: boolean },
   ctx: Pick<ExtensionCommandContext, "modelRegistry">,
 ): Promise<Record<string, unknown>> {
   if (!params.baseUrl) throw new Error("baseUrl is required for action=add");
+
+  // Validate before touching anything: registering a lane under a protocol it
+  // does not speak produces a catalog of models that all fail at inference.
+  let explicitApi: GatewayApi | undefined;
+  if (params.api !== undefined && params.api !== "") {
+    if (!isGatewayApi(params.api)) {
+      throw new Error(
+        `Invalid api '${params.api}' — expected openai-completions, openai-responses, or anthropic-messages`,
+      );
+    }
+    explicitApi = params.api;
+  }
 
   const existingIds = new Set(ctx.modelRegistry.getAll().map((model) => model.provider));
   for (const providerId of ctx.modelRegistry.getRegisteredProviderIds()) existingIds.add(providerId);
@@ -349,7 +536,7 @@ async function addGateway(
     id,
     name: params.displayName?.trim() || managed?.name || suggested.name,
     baseUrl: normalizeBaseUrl(params.baseUrl),
-    ...(managed?.api ? { api: managed.api } : {}),
+    ...(explicitApi ?? managed?.api ? { api: explicitApi ?? managed!.api! } : {}),
     ...(params.apiKeyEnv?.trim() ? { apiKeyEnv: params.apiKeyEnv.trim() } : managed?.apiKeyEnv ? { apiKeyEnv: managed.apiKeyEnv } : {}),
     ...(params.compat && Object.keys(params.compat).length > 0
       ? { compat: params.compat }
@@ -406,10 +593,11 @@ async function removeGateway(
   const current = configFile.gateways.find((gateway) => gateway.id === gatewayId);
   if (!current) throw new Error(`Unknown gateway: ${gatewayId}`);
 
-  configFile = { version: 1, gateways: configFile.gateways.filter((gateway) => gateway.id !== gatewayId) };
-  await saveConfig(configFile);
+  await persistConfig({ version: 1, gateways: configFile.gateways.filter((gateway) => gateway.id !== gatewayId) });
   pi.unregisterProvider(gatewayId);
   lastSync.delete(gatewayId);
+  await deleteDiscoveryMeta(gatewayId);
+  delete persistedMeta[gatewayId];
   const cleanup = await cleanupGatewayState(gatewayId, ctx);
   await ctx.modelRegistry.refresh();
 
@@ -447,14 +635,21 @@ function summarizeSync(id: string): Record<string, unknown> {
   const info = lastSync.get(id);
   if (!info) return { state: "not-synced", hint: `run /login ${id} then /gw sync ${id}` };
   if (!info.ok) return { state: "error", at: ageMs(info.syncedAt), error: info.error };
+  const drifted = driftedGateways.has(id);
   return {
-    state: "ok",
+    state: drifted ? "config-changed" : "ok",
     at: ageMs(info.syncedAt),
+    ...(drifted
+      ? { hint: `config edited since this catalog was derived — run /gw sync ${id}` }
+      : {}),
     models: info.modelCount,
     matched: info.matchedCount,
     unmatched: info.unmatchedCount ?? info.unmatched?.length ?? 0,
     litellmEnriched: info.litellmEnriched,
+    ...(info.api ? { api: info.api, apiSource: info.apiSource } : {}),
     ...(info.maxTokensCappedCount ? { maxTokensCapped: info.maxTokensCappedCount } : {}),
+    ...(info.excludedUnusableCount ? { excludedUnusable: info.excludedUnusableCount } : {}),
+    ...(info.quirksAppliedCount ? { quirksApplied: info.quirksAppliedCount } : {}),
     ...(info.healthyEndpoints !== undefined
       ? { healthyEndpoints: info.healthyEndpoints, unhealthyEndpoints: info.unhealthyEndpoints ?? 0 }
       : {}),
@@ -506,8 +701,7 @@ async function overrideModel(
     ...gateway,
     ...(Object.keys(overrides).length > 0 ? { modelOverrides: overrides } : { modelOverrides: undefined }),
   };
-  configFile = { version: 1, gateways: configFile.gateways.map((g) => (g.id === gatewayId ? updated : g)) };
-  await saveConfig(configFile);
+  await persistConfig({ version: 1, gateways: configFile.gateways.map((g) => (g.id === gatewayId ? updated : g)) });
   pi.registerProvider(makeProvider(updated));
   await ctx.modelRegistry.refresh({ providers: [gatewayId], force: true });
 
@@ -600,9 +794,423 @@ async function selfHealUnknownModel(
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------
+// Portable bundles: export / import
+// -------------------------------------------------------------------------
+
+interface GatewayBundle {
+  bundleVersion: 1;
+  generatedBy: string;
+  generatedAt: string;
+  config: GatewayConfigFile;
+  /** Present only when the export was explicitly asked to include keys. */
+  credentials?: Record<string, string>;
+}
+
+async function readStoredApiKeys(): Promise<Record<string, string>> {
+  try {
+    const data = JSON.parse(await readFile(AUTH_PATH, "utf8")) as Record<
+      string,
+      { type?: string; key?: string }
+    >;
+    const out: Record<string, string> = {};
+    for (const [id, entry] of Object.entries(data)) {
+      if (entry?.type === "api_key" && typeof entry.key === "string" && entry.key) out[id] = entry.key;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function mergeStoredApiKeys(credentials: Record<string, string>): Promise<string[]> {
+  const tempPath = `${AUTH_PATH}.${process.pid}.${Date.now()}.tmp`;
+  let auth: Record<string, unknown> = {};
+  try {
+    auth = JSON.parse(await readFile(AUTH_PATH, "utf8")) as Record<string, unknown>;
+  } catch {
+    // No auth file yet.
+  }
+  const written: string[] = [];
+  for (const [id, key] of Object.entries(credentials)) {
+    if (typeof key !== "string" || !key) continue;
+    auth[id] = { type: "api_key", key };
+    written.push(id);
+  }
+  await mkdir(dirname(AUTH_PATH), { recursive: true });
+  try {
+    await writeFile(tempPath, `${JSON.stringify(auth, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(tempPath, AUTH_PATH);
+    await chmod(AUTH_PATH, 0o600);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+  return written;
+}
+
+interface ExportResult {
+  path: string;
+  gateways: number;
+  gatewayIds: string[];
+  credentialsIncluded: boolean;
+  credentialProviders: string[];
+  note: string;
+}
+
+async function exportBundle(params: {
+  path?: string;
+  withKeys?: boolean;
+  overwrite?: boolean;
+}): Promise<ExportResult> {
+  if (!params.path) throw new Error("path is required for action=export");
+  const target = resolvePath(params.path);
+  if (existsSync(target) && !params.overwrite) {
+    throw new Error(`Refusing to overwrite ${target} — pass overwrite=true to replace it`);
+  }
+  if (configFile.gateways.length === 0) throw new Error("No gateways configured — nothing to export");
+
+  const credentials = params.withKeys ? await readStoredApiKeys() : undefined;
+  const bundle: GatewayBundle = {
+    bundleVersion: 1,
+    generatedBy: "pi-gateway-discovery",
+    generatedAt: new Date().toISOString(),
+    // Deep copy: exporting must not hand out references into live config.
+    config: JSON.parse(JSON.stringify(configFile)) as GatewayConfigFile,
+    ...(credentials && Object.keys(credentials).length > 0 ? { credentials } : {}),
+  };
+
+  await mkdir(dirname(target), { recursive: true });
+  // Always 0600: even a key-less bundle names internal endpoints.
+  await writeFile(target, `${JSON.stringify(bundle, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(target, 0o600);
+
+  return {
+    path: target,
+    gateways: bundle.config.gateways.length,
+    gatewayIds: bundle.config.gateways.map((g) => g.id),
+    credentialsIncluded: !!bundle.credentials,
+    credentialProviders: bundle.credentials ? Object.keys(bundle.credentials) : [],
+    note: bundle.credentials
+      ? "WARNING: this file contains API keys. Treat it as a secret; do not commit or paste it."
+      : "API keys are not included. Run /login <gatewayId> after importing, or set apiKeyEnv per gateway.",
+  };
+}
+
+interface ImportResult {
+  from: string;
+  mode: "merge" | "replace";
+  added: string[];
+  updated: string[];
+  removed: string[];
+  unchanged: number;
+  totalGateways: number;
+  credentialsInstalled: string[];
+  needsLogin: string[];
+  note?: string;
+}
+
+async function importBundle(
+  pi: ExtensionAPI,
+  params: { path?: string; mode?: string },
+  ctx: Pick<ExtensionCommandContext, "modelRegistry">,
+): Promise<ImportResult> {
+  if (!params.path) throw new Error("path is required for action=import");
+  const target = resolvePath(params.path);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(target, "utf8"));
+  } catch (error) {
+    throw new Error(`Cannot read bundle ${target}: ${errorMessage(error)}`);
+  }
+
+  const record = (parsed ?? {}) as Record<string, unknown>;
+  const configInput = record.bundleVersion === 1 ? record.config : record;
+  // Reuse the loader's validator: an import must be held to exactly the rules
+  // the live config file is, or a bad bundle can reach the registry.
+  const incoming = parseGatewayConfig(configInput);
+
+  let credentialsInstalled: string[] = [];
+  const creds = record.credentials;
+  if (creds && typeof creds === "object" && !Array.isArray(creds)) {
+    credentialsInstalled = await mergeStoredApiKeys(creds as Record<string, string>);
+  }
+
+  const mode: "merge" | "replace" = params.mode === "replace" ? "replace" : "merge";
+  let next: GatewayConfigFile;
+  if (mode === "replace") {
+    next = incoming;
+  } else {
+    const byId = new Map(configFile.gateways.map((g) => [g.id, g]));
+    for (const gateway of incoming.gateways) byId.set(gateway.id, gateway);
+    next = {
+      version: 1,
+      autoRefreshTtlHours: incoming.autoRefreshTtlHours ?? configFile.autoRefreshTtlHours,
+      gateways: [...byId.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    };
+  }
+
+  const delta = diffGatewayConfigs(configFile, next);
+  await persistConfig(next);
+  for (const id of delta.removed) {
+    try {
+      pi.unregisterProvider(id);
+    } catch {
+      // Already gone.
+    }
+    lastSync.delete(id);
+    driftedGateways.delete(id);
+  }
+  const toSync = [...delta.added, ...delta.modified];
+  for (const id of toSync) {
+    const gateway = next.gateways.find((candidate) => candidate.id === id);
+    if (gateway) pi.registerProvider(makeProvider(gateway));
+  }
+  if (toSync.length > 0) {
+    await ctx.modelRegistry.refresh({ providers: toSync, force: true }).catch(() => {});
+  }
+
+  const missingKeys = next.gateways
+    .filter((g) => !g.apiKeyEnv)
+    .map((g) => g.id)
+    .filter((id) => !credentialsInstalled.includes(id));
+
+  const imported: ImportResult = {
+    from: target,
+    mode,
+    added: delta.added,
+    updated: delta.modified,
+    removed: delta.removed,
+    unchanged: next.gateways.length - delta.added.length - delta.modified.length - delta.removed.length,
+    totalGateways: next.gateways.length,
+    credentialsInstalled,
+    needsLogin: missingKeys,
+    ...(missingKeys.length > 0 ? { note: `Run /login for: ${missingKeys.join(", ")}` } : {}),
+  };
+  return imported;
+}
+
+// -------------------------------------------------------------------------
+// Setup health
+// -------------------------------------------------------------------------
+
+/**
+ * Answer "is this actually working?" without having to try a model first.
+ *
+ * Each check corresponds to a failure that produced no useful error when it
+ * happened: a gateway with no credential, a catalog derived from since-edited
+ * config, a saved default model the upstream renamed, a lane whose discovery
+ * failed silently. All of them are invisible until a request fails, which is
+ * the worst possible moment to find out.
+ */
+export function doctorGateways(
+  ctx: Pick<ExtensionCommandContext, "modelRegistry">,
+): {
+  ok: boolean;
+  problems: string[];
+  warnings: string[];
+  gateways: Array<{
+    id: string;
+    api: string;
+    models: number;
+    excludedUnusable: number | null;
+    autoConfigured: number | null;
+    synced: string;
+    quirksSuppressed: Array<{ id: string; note: string }>;
+    issues: string[];
+  }>;
+} {
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  const all = ctx.modelRegistry.getAll();
+
+  if (configFile.gateways.length === 0) {
+    return {
+      ok: false,
+      problems: ["no gateways configured — run /gw add <baseUrl>"],
+      warnings: [],
+      gateways: [],
+    };
+  }
+
+  const ttlMs = ttlMsFromConfig(configFile);
+  const gateways = configFile.gateways.map((gateway) => {
+    const info = discoveryMetaFor(gateway.id);
+    const models = all.filter((m) => m.provider === gateway.id);
+    const issues: string[] = [];
+
+    // A fresh session legitimately restores models from the cache without
+    // contacting the gateway, so "never synced here" is only a problem when
+    // nothing was restored — otherwise it is informational. Reporting it as a
+    // problem would make every healthy session look broken and teach users to
+    // ignore the output.
+    const live = lastSync.get(gateway.id);
+    if (!live) {
+      if (models.length === 0) issues.push("no models registered and never synced in this session");
+      else warnings.push(`${gateway.id}: using the cached catalog (${models.length} models); run /gw sync ${gateway.id} to re-discover`);
+    } else if (!live.ok) issues.push(`discovery failed: ${live.error ?? "unknown error"}`);
+    else if (driftedGateways.has(gateway.id))
+      issues.push(`config edited after this catalog was built (run /gw sync ${gateway.id})`);
+
+    if (!resolveGatewayKey(gateway)) {
+      issues.push(
+        gateway.apiKeyEnv
+          ? `apiKeyEnv ${gateway.apiKeyEnv} is not set in this environment`
+          : `no credential — run /login ${gateway.id} or set apiKeyEnv`,
+      );
+    }
+    if (live?.ok && models.length === 0) {
+      issues.push("catalog is empty — every model was filtered or excluded");
+    }
+    if (info && ttlMs > 0 && Date.now() - info.syncedAt > ttlMs) {
+      warnings.push(`${gateway.id}: catalog older than the ${Math.round(ttlMs / 3_600_000)}h refresh TTL`);
+    }
+
+    for (const issue of issues) problems.push(`${gateway.id}: ${issue}`);
+    return {
+      id: gateway.id,
+      api: gateway.api ?? "(negotiated)",
+      models: models.length,
+      // null means "no discovery record exists to answer from"; 0 means the
+      // record exists and says nothing was filtered. Collapsing the two would
+      // make a clean lane look like an unmeasured one.
+      excludedUnusable: info ? (info.excludedUnusableDetail?.length ?? 0) : null,
+      autoConfigured: info ? (info.quirksAppliedDetail?.length ?? 0) : null,
+      synced: info ? (info.persisted ? `${ageMs(info.syncedAt)} (from disk)` : ageMs(info.syncedAt)) : "never",
+      quirksSuppressed: info?.quirksSuppressed ?? [],
+      issues,
+    };
+  });
+
+  // A saved default pointing at a renamed model resolves to *a* provider and
+  // then fails at request time with an error that never says "your default
+  // model no longer exists" — the exact trap of a gateway that renames models.
+  const saved = readSettingsDefault();
+  if (saved) {
+    if (configFile.gateways.some((g) => g.id === saved.provider)) {
+      const known = all.some((m) => m.provider === saved.provider && m.id === saved.modelId);
+      if (!known) {
+        const served = all.filter((m) => m.provider === saved.provider).map((m) => m.id);
+        problems.push(
+          `settings default ${saved.provider}/${saved.modelId} is not registered`
+          + (served.length
+            ? `; this gateway serves: ${served.slice(0, 6).join(", ")}${served.length > 6 ? " …" : ""}`
+            : ""),
+        );
+      }
+    }
+  }
+
+  if (isOffline()) warnings.push("PI_OFFLINE is set — discovery will not reach the network");
+
+  return { ok: problems.length === 0, problems, warnings, gateways };
+}
+
+// -------------------------------------------------------------------------
+// Effective configuration
+// -------------------------------------------------------------------------
+
+/**
+ * Report the *resolved* settings for a gateway or one of its models, with the
+ * layer each value came from.
+ *
+ * After four merge layers (defaults, upstream-declared metadata, quirk table,
+ * gateway.compat, modelOverrides) the composed answer is not recoverable from
+ * the config file alone, and "did my setting take effect?" was otherwise only
+ * answerable by re-deriving the merge by hand.
+ */
+function describeGateway(
+  params: { gatewayId?: string; modelId?: string },
+  ctx: Pick<ExtensionCommandContext, "modelRegistry">,
+): Record<string, unknown> {
+  if (!params.gatewayId) throw new Error("gatewayId is required for action=describe");
+  const gatewayId = validateGatewayId(params.gatewayId);
+  const gateway = configFile.gateways.find((g) => g.id === gatewayId);
+  if (!gateway) throw new Error(`Unknown gateway: ${gatewayId}`);
+
+  const meta = discoveryMetaFor(gatewayId);
+  const all = ctx.modelRegistry.getAll().filter((m) => m.provider === gatewayId);
+
+  const provenanceFor = (id: string): Record<string, unknown> => {
+    // Must read the merged view: in a fresh session `lastSync` is empty and the
+    // provenance lives only in the persisted record, so consulting lastSync
+    // alone made every auto-configured value look like a pi-core default.
+    const applied = meta?.quirksAppliedDetail?.find((q) => q.id === id);
+    const override = gateway.modelOverrides?.[id];
+    return {
+      api: override?.api ? "modelOverrides" : applied?.source === "quirk" ? "quirk-table" : gateway.api ? "gateway.api" : "negotiated-or-default",
+      thinkingLevelMap: override?.thinkingLevelMap
+        ? "modelOverrides"
+        : applied?.source === "declared"
+          ? "upstream-declared"
+          : applied?.source === "quirk"
+            ? "quirk-table"
+            : "default (pi core clamping)",
+      compat: override?.compat ? "modelOverrides" : gateway.compat ? "gateway.compat + defaults" : "defaults",
+      note: applied?.note,
+      suppressed: meta?.quirksSuppressed?.find((q) => q.id === id)?.note,
+    };
+  };
+
+  if (params.modelId) {
+    const model = all.find((m) => m.id === params.modelId);
+    if (!model) {
+      throw new Error(
+        `Model '${params.modelId}' is not registered on ${gatewayId} (${all.length} models known; it may be excluded)`,
+      );
+    }
+    return {
+      gateway: gatewayId,
+      baseUrl: gateway.baseUrl,
+      model: {
+        id: model.id,
+        name: model.name,
+        api: model.api,
+        provider: model.provider,
+        inferenceBaseUrl: model.baseUrl,
+        reasoning: model.reasoning,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        input: model.input,
+        compat: model.compat ?? null,
+        thinkingLevelMap: model.thinkingLevelMap ?? null,
+      },
+      source: provenanceFor(model.id),
+    };
+  }
+
+  return {
+    gateway: gatewayId,
+    name: gateway.name,
+    configuredBaseUrl: gateway.baseUrl,
+    configuredApi: gateway.api ?? "(unset — negotiated)",
+    inferenceBaseUrl: meta?.inferenceBaseUrl ?? inferenceBaseUrlForApi(gateway.baseUrl, gateway.api ?? "openai-completions"),
+    apiKeyEnv: gateway.apiKeyEnv ?? null,
+    directHttpStreaming: gateway.directHttpStreaming ?? false,
+    gatewayCompat: gateway.compat ?? null,
+    modelOverrides: gateway.modelOverrides ? Object.keys(gateway.modelOverrides) : [],
+    excludedModels: gateway.excludedModels ?? [],
+    excludeUnusable: gateway.excludeUnusable !== false,
+    sync: meta
+      ? {
+          ok: true,
+          from: meta.persisted ? "persisted metadata" : "this session",
+          models: meta.modelCount,
+          excludedUnusable: meta.excludedUnusableDetail ?? [],
+          autoConfigured: (meta.quirksAppliedDetail ?? []).map((q) => ({ id: q.id, via: q.source, note: q.note })),
+          suppressedQuirks: meta.quirksSuppressed ?? [],
+        }
+      : { ok: false, note: "no discovery metadata recorded for this gateway" },
+    registeredModels: all.map((m) => m.id),
+  };
+}
+
+
 export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promise<void> {
   try {
     configFile = await loadConfig();
+    loadedConfigFingerprint = fingerprintConfig(configFile);
+    persistedMeta = await loadDiscoveryMeta();
   } catch (error) {
     console.error(`[gateway-discovery] ${errorMessage(error)}`);
     return;
@@ -622,7 +1230,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // `pi -p` — starts with a fresh model list. Fresh cache → zero delay.
   if (configFile.gateways.length > 0 && !isOffline()) {
     try {
-      await refreshStaleGateways(configFile, (id, info) => {
+      await refreshStaleGateways(configFile, async (id, info) => {
         lastSync.set(id, {
           ok: info.ok,
           syncedAt: Date.now(),
@@ -634,6 +1242,9 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           ...(info.maxTokensCappedCount !== undefined ? { maxTokensCappedCount: info.maxTokensCappedCount } : {}),
           ...(info.error ? { error: info.error } : {}),
         });
+        if (info.ok && info.status) {
+          await recordDiscoveryMeta(id, info.status.modelCount, info.status);
+        }
       });
     } catch (error) {
       console.error(`[gateway-discovery] auto-refresh failed: ${errorMessage(error)}`);
@@ -645,6 +1256,7 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // -------------------------------------------------------------------------
 
   let stopStoreWatcher: (() => void) | undefined;
+  let stopConfigWatcher: (() => void) | undefined;
   let periodicTimer: NodeJS.Timeout | undefined;
 
   pi.on("session_start", async (_event, ctx) => {
@@ -667,6 +1279,14 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
         void ctx.modelRegistry.refresh({ providers: ids, allowNetwork: false }).catch(() => {});
       },
     });
+    stopConfigWatcher?.();
+    stopConfigWatcher = startConfigWatcher({
+      onExternalChange: () => {
+        // Reconcile providers with the file. Discovery stays explicit, so a
+        // stray edit can never trigger a network sync behind the user's back.
+        void ensureConfigCurrent(pi, ctx).catch(() => {});
+      },
+    });
     if (periodicTimer) clearInterval(periodicTimer);
     periodicTimer = setInterval(() => {
       const stale = staleGatewayIds(configFile, ttlMsFromConfig(configFile));
@@ -680,6 +1300,8 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   pi.on("session_shutdown", () => {
     stopStoreWatcher?.();
     stopStoreWatcher = undefined;
+    stopConfigWatcher?.();
+    stopConfigWatcher = undefined;
     if (periodicTimer) clearInterval(periodicTimer);
     periodicTimer = undefined;
   });
@@ -689,9 +1311,9 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
   // -------------------------------------------------------------------------
 
   pi.registerCommand("gw", {
-    description: "Gateway model discovery: /gw add <url> [id] [token] [direct=true] | remove <id> | sync [id] | list | override <id> <model> [k=v ...]",
+    description: "Gateway model discovery: /gw add <url> [id] [api=…] [direct=true] | remove <id> | sync [id] | list | describe <id> [model] | override <id> <model> [k=v] | export [path] | import <path>",
     getArgumentCompletions: (prefix) => {
-      const subcommands = ["add", "remove", "sync", "list", "override"].filter((c) => c.startsWith(prefix));
+      const subcommands = ["add", "remove", "sync", "list", "describe", "doctor", "override", "export", "import"].filter((c) => c.startsWith(prefix));
       if (subcommands.length > 0) return subcommands.map((value) => ({ value, label: value }));
       const gateways = configFile.gateways
         .filter((g) => g.id.startsWith(prefix))
@@ -700,6 +1322,8 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     },
     handler: async (args, ctx) => {
       const [sub, ...rest] = args.trim().split(/\s+/u);
+      // Pick up config edits made outside this session before acting on it.
+      await ensureConfigCurrent(pi, ctx);
       switch (sub) {
         case "add":
           await cmdAdd(pi, rest.join(" "), ctx);
@@ -714,12 +1338,65 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
         case undefined:
           cmdList(ctx);
           break;
+        case "doctor": {
+          const report = doctorGateways(ctx);
+          const lines = [
+            report.ok ? "✓ gateway setup looks healthy" : `✗ ${report.problems.length} problem(s)`,
+            ...report.problems.map((p) => `  ! ${p}`),
+            ...report.warnings.map((w) => `  ~ ${w}`),
+            ...report.gateways.map((g) =>
+              `  ${g.id}: ${g.models} models (${g.api}), ${g.excludedUnusable} excluded, ${g.autoConfigured} auto-configured, synced ${g.synced}`),
+          ];
+          ctx.ui.notify(lines.join("\n"), report.ok ? "info" : "error");
+          break;
+        }
+        case "describe":
+          try {
+            const [gatewayId, modelId] = rest;
+            ctx.ui.notify(JSON.stringify(describeGateway({ gatewayId, modelId }, ctx), null, 2), "info");
+          } catch (error) {
+            ctx.ui.notify(errorMessage(error), "error");
+          }
+          break;
+        case "export":
+          try {
+            const pathArg = rest.find((t) => !t.startsWith("--"));
+            const result = await exportBundle({
+              path: pathArg ?? "pi-gateways.json",
+              withKeys: rest.includes("--keys"),
+              overwrite: rest.includes("--force"),
+            });
+            ctx.ui.notify(
+              `Exported ${result.gateways} gateway(s) to ${result.path}`
+                + `${result.credentialsIncluded ? " INCLUDING API KEYS" : " (no API keys)"}`
+                + `\n${result.note}`,
+              result.credentialsIncluded ? "warning" : "info",
+            );
+          } catch (error) {
+            ctx.ui.notify(errorMessage(error), "error");
+          }
+          break;
+        case "import":
+          try {
+            const pathArg = rest.find((t) => !t.startsWith("--"));
+            if (!pathArg) throw new Error("Usage: /gw import <path> [--replace]");
+            const result = await importBundle(pi, { path: pathArg, mode: rest.includes("--replace") ? "replace" : "merge" }, ctx);
+            ctx.ui.notify(
+              `Imported ${result.totalGateways} gateway(s) from ${pathArg}: `
+                + `${result.added.length} added, ${result.updated.length} updated, ${result.removed.length} removed`
+                + `${result.needsLogin.length ? `\nNeeds /login: ${result.needsLogin.join(", ")}` : ""}`,
+              "info",
+            );
+          } catch (error) {
+            ctx.ui.notify(errorMessage(error), "error");
+          }
+          break;
         case "override":
           await cmdOverride(pi, rest, ctx);
           break;
         default:
           ctx.ui.notify(
-            "Usage: /gw add <baseUrl> [id] [token] [direct=true] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
+            "Usage: /gw add <baseUrl> [id] [token] [api=…] [direct=true|false] | /gw remove <id> | /gw sync [id] | /gw list | /gw override <id> <model> [k=v ... | clear]",
             "warning",
           );
       }
@@ -800,15 +1477,31 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       ctx.ui.notify("/gw add requires interactive or RPC UI mode (or use the gateways tool)", "error");
       return;
     }
-    const [rawUrl, rawId, ...rest] = args.trim().split(/\s+/u);
-    // The first non-flag token is the API token; direct=… tokens are flags.
-    const rawToken = rest.find((t) => !t.startsWith("direct"));
+    const tokens = args.trim().length > 0 ? args.trim().split(/\s+/u) : [];
+    const [rawUrl, rawId] = tokens;
+    // `key=value` tokens are flags; everything else is positional. Parsing the
+    // first non-`direct` token as the API key (the previous behaviour) meant a
+    // mistyped or unsupported flag such as `api=anthropic-messages` was
+    // silently written to auth.json as the gateway's secret.
+    const flags: Record<string, string> = {};
+    const positional: string[] = [];
+    for (const token of tokens.slice(2)) {
+      const eq = token.indexOf("=");
+      if (eq > 0) flags[token.slice(0, eq)] = token.slice(eq + 1);
+      else positional.push(token);
+    }
+    const rawToken = positional[0];
+
     let directHttpStreaming: boolean | undefined;
-    for (const token of rest) {
-      if (token === "direct=true" || token === "directStreaming=true") directHttpStreaming = true;
-      else if (token === "direct=false" || token === "directStreaming=false") directHttpStreaming = false;
-      else if (token !== rawToken) {
-        ctx.ui.notify(`Ignoring unknown flag: ${token} (supported: direct=true|false)`, "warning");
+    for (const [name, value] of Object.entries(flags)) {
+      if (name === "direct" || name === "directStreaming") {
+        if (value !== "true" && value !== "false") {
+          ctx.ui.notify(`Ignoring ${name}=${value} (expected true or false)`, "warning");
+          continue;
+        }
+        directHttpStreaming = value === "true";
+      } else if (name !== "api") {
+        ctx.ui.notify(`Ignoring unknown flag: ${name}=… (supported: api=…, direct=true|false)`, "warning");
       }
     }
 
@@ -829,17 +1522,25 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       id = promptedId;
     }
 
-    let token = rawToken;
+    let token: string | undefined = rawToken;
     if (!token && ctx.hasUI) {
       const promptedToken = await ctx.ui.input("API token (or leave blank to set later with /login)", "");
       token = promptedToken || undefined;
     }
 
     try {
-      const result = await addGateway(pi, { baseUrl, gatewayId: id, apiToken: token, directHttpStreaming }, ctx);
+      const result = await addGateway(
+        pi,
+        { baseUrl, gatewayId: id, apiToken: token, api: flags["api"], directHttpStreaming },
+        ctx,
+      );
       const gateway = result.gateway as GatewayConfig;
       if (token) {
-        ctx.ui.notify(`Registered gateway '${gateway.id}' (${gateway.name}). API key stored.`, "info");
+        ctx.ui.notify(
+          `Registered gateway '${gateway.id}' (${gateway.name}). API key stored. ` +
+            `Note: it was typed on the command line, so it is visible in this session log and your shell history.`,
+          "warning",
+        );
       } else {
         ctx.ui.notify(`Registered gateway '${gateway.id}' (${gateway.name}). Run /login ${gateway.id} to store the API key.`, "info");
         ctx.ui.setEditorText(`/login ${gateway.id}`);
@@ -929,13 +1630,23 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     const lines = configFile.gateways.map((gateway) => {
       const sync = summarizeSync(gateway.id);
       const syncText =
-        sync.state === "ok"
-          ? `${sync.models} models, ${sync.matched} matched, ${sync.unmatched} unmatched${sync.maxTokensCapped ? `, ${sync.maxTokensCapped} output-capped` : ""} (${sync.at})`
+        sync.state === "ok" || sync.state === "config-changed"
+          ? `${sync.models} models, ${sync.matched} matched, ${sync.unmatched} unmatched`
+            + `${sync.maxTokensCapped ? `, ${sync.maxTokensCapped} output-capped` : ""}`
+            + `${sync.excludedUnusable ? `, ${sync.excludedUnusable} excluded` : ""}`
+            + `${sync.quirksApplied ? `, ${sync.quirksApplied} auto-configured` : ""}`
+            + ` (${sync.at})`
+            + `${sync.state === "config-changed" ? `\n  \u26a0 ${sync.hint}` : ""}`
           : sync.state === "error"
             ? `error: ${sync.error}`
             : `not synced — ${sync.hint}`;
       const flags = gateway.directHttpStreaming ? " [direct-http-streaming]" : "";
-      return `${gateway.id} (${gateway.api ?? "openai-completions"}) ${gateway.baseUrl}${flags}\n  ${syncText}`;
+      // Show the protocol in use, not the one written in config: when `api` is
+      // omitted it is negotiated at discovery time, and "did my setting take
+      // effect?" is the question /gw list is being asked.
+      const effectiveApi = (sync.api ?? gateway.api ?? "openai-completions") as string;
+      const apiLabel = sync.api && sync.apiSource === "negotiated" ? `${effectiveApi} (negotiated)` : effectiveApi;
+      return `${gateway.id} (${apiLabel}) ${gateway.baseUrl}${flags}\n  ${syncText}`;
     });
     ctx.ui.notify(lines.join("\n"), "info");
   }
@@ -948,10 +1659,22 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
     name: "gateways",
     label: "Gateway Models",
     description:
-      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway (optionally with directHttpStreaming for HTTP/1.1-only gateways whose chunked SSE responses the built-in undici fetch buffers), remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides, or inspect gateway status.",
-    promptSnippet: "Add, remove, sync, override, or inspect model-discovery gateways",
+      "Manage model-discovery gateways (OpenAI-compatible / LiteLLM endpoints): add a gateway (optionally with an explicit inference protocol or directHttpStreaming), remove it (including stored credential and model cache), force a model-list sync, set or clear per-model overrides, inspect gateway status, describe the *effective* configuration of a gateway or model (with the layer each value came from), and export/import a portable bundle so a tuned setup can be reproduced on another machine.",
+    promptSnippet: "Add, remove, sync, override, describe, or export/import model-discovery gateways",
     parameters: Type.Object({
-      action: StringEnum(["add", "remove", "sync", "list", "override"] as const),
+      action: StringEnum(["add", "remove", "sync", "list", "describe", "doctor", "override", "export", "import"] as const),
+      path: Type.Optional(
+        Type.String({ description: "Bundle file path for action=export (write target) or action=import (read source)" }),
+      ),
+      withKeys: Type.Optional(
+        Type.Boolean({ description: "action=export only: include stored API keys. Off by default — a key-less bundle is the safe artifact to share. Enable only for private machine-to-machine migration." }),
+      ),
+      overwrite: Type.Optional(
+        Type.Boolean({ description: "action=export only: replace an existing file at path" }),
+      ),
+      mode: Type.Optional(
+        Type.String({ description: "action=import only: 'merge' (default, upsert by gateway id) or 'replace' (adopt the bundle wholesale)" }),
+      ),
       baseUrl: Type.Optional(Type.String({ description: "Gateway base URL for action=add" })),
       gatewayId: Type.Optional(Type.String({ description: "Gateway id for add/remove/sync/override" })),
       displayName: Type.Optional(Type.String({ description: "Display name for action=add" })),
@@ -966,7 +1689,8 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       modelId: Type.Optional(Type.String({ description: "Model id for action=override" })),
       api: Type.Optional(
         StringEnum(["openai-completions", "openai-responses", "anthropic-messages"] as const, {
-          description: "Route a model to a different protocol (action=override)",
+          description:
+            "Protocol for a model (action=override) or a whole lane (action=add). For add, omit it to let discovery negotiate OpenAI vs Anthropic lanes; set it only to override that.",
         }),
       ),
       reasoning: Type.Optional(Type.Boolean({ description: "Force reasoning on/off for a model (action=override)" })),
@@ -982,6 +1706,8 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Pick up config edits made outside this session before acting on it.
+      await ensureConfigCurrent(pi, ctx);
       let result: unknown;
       switch (params.action) {
         case "add":
@@ -992,6 +1718,18 @@ export default async function gatewayDiscoveryExtension(pi: ExtensionAPI): Promi
           break;
         case "sync":
           result = await syncGateways(params, ctx);
+          break;
+        case "describe":
+          result = describeGateway(params, ctx);
+          break;
+        case "doctor":
+          result = doctorGateways(ctx);
+          break;
+        case "export":
+          result = await exportBundle(params);
+          break;
+        case "import":
+          result = await importBundle(pi, params, ctx);
           break;
         case "override":
           result = await overrideModel(pi, params, ctx);

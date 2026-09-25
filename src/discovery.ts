@@ -32,6 +32,31 @@ const MAX_HEALTH_ENDPOINTS = 64;
 const DEFAULT_CONTEXT_WINDOW = 32_768;
 const DEFAULT_MAX_TOKENS = 8_192;
 
+/**
+ * Compat flags stamped on every discovered model.
+ *
+ * pi core derives these from the provider name and the base-URL host
+ * (`detectCompat`). A gateway id like `acme-mistral` at `gateway.acme.example`
+ * matches no known vendor fingerprint, so pi classifies the endpoint as
+ * standard OpenAI and enables every optional OpenAI-ism. Strict frontends then
+ * reject the request outright:
+ *
+ *   - `store`                  -> Gemini: 400 `Unknown name "store"`
+ *                                 Mistral: 422 `extra_forbidden`
+ *   - role `developer`         -> Mistral: 422 (it is sent for every
+ *                                 `reasoning: true` model)
+ *
+ * A gateway is by definition a non-standard proxy, so assume the safe side.
+ * Both defaults are lossless: `store` only matters if you *want* server-side
+ * retention, and `system` is accepted strictly more widely than `developer`.
+ * Anything here can still be raised explicitly via `gateway.compat` or a
+ * per-model override, which both merge on top of these defaults.
+ */
+const GATEWAY_COMPAT_DEFAULTS = {
+  supportsStore: false,
+  supportsDeveloperRole: false,
+};
+
 /** Fields from litellm_params that may contain secrets or deployment details. */
 const SENSITIVE_PARAM_KEYS = new Set([
   "api_key", "api_base", "api_version", "base_model",
@@ -61,6 +86,14 @@ export interface GatewayDiscoveryStatus {
   matched: ModelMatch[];
   unmatched: Array<{ id: string; candidates: ModelCandidate[] }>;
   inferenceBaseUrl: string;
+  /** Protocol used for inference, and how it was chosen. */
+  api: GatewayApi;
+  /**
+   * `explicit`   — `gateway.api` was set in config; used verbatim.
+   * `negotiated` — no `api` in config; picked by finding an auth-header style
+   *                whose `/models` call returns a model array.
+   */
+  apiSource: "explicit" | "negotiated";
   /** Present when the gateway answered LiteLLM /health. */
   healthyEndpoints?: number;
   unhealthyEndpoints?: number;
@@ -68,6 +101,21 @@ export interface GatewayDiscoveryStatus {
   litellmEnriched: boolean;
   /** Models whose advertised output ceiling was capped to ¼ of the window. */
   maxTokensCapped?: Array<{ id: string; reported: number; capped: number }>;
+  /**
+   * Models dropped because they can never serve a chat request (realtime,
+   * audio, completions-only, no-function-calling). Reported rather than hidden:
+   * "why is model X missing?" should be answerable from the config alone.
+   */
+  excludedUnusable?: Array<{ id: string; reason: string }>;
+  /** Models whose protocol or thinking levels came from the quirk table. */
+  quirksApplied?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  /**
+   * Quirks that would have applied but were suppressed by an explicit lane
+   * `api`. Reported rather than dropped quietly: an explicit lane setting wins
+   * (correct), but the resulting dead model otherwise looks like a backend bug
+   * rather than a rule the user overrode.
+   */
+  quirksSuppressed?: Array<{ id: string; note: string }>;
 }
 
 export interface GatewayDiscoveryResult {
@@ -153,6 +201,13 @@ async function fetchJson(
   }
 }
 
+import {
+  declaredThinkingLevelMap,
+  resolveQuirk,
+  retiredModelReason,
+  unusableModelReason,
+} from "./quirks.ts";
+
 // ---------------------------------------------------------------------------
 // Model list
 // ---------------------------------------------------------------------------
@@ -165,6 +220,10 @@ function asRecord(value: unknown): RawEntry | undefined {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -453,29 +512,13 @@ function normalizeModelId(id: string): string {
   return id.startsWith("models/") ? id.slice("models/".length) : id;
 }
 
-/**
- * Models that are not chat models — never register them. Covers
- * embedding/reranker families plus obvious audio/speech, moderation, OCR,
- * image-generation, and legacy non-chat completions families.
- */
-function isNonChatModel(id: string): boolean {
-  const normalized = id.toLowerCase();
-  return (
-    /(^|[/:._-])(embed|embedding|bge|gte|e5|rerank)([/:._-]|$)/u.test(normalized) ||
-    normalized.includes("nomic-embed") ||
-    /(^|[/:._-])(tts|whisper|transcribe|speech|audio)([/:._-]|$)/u.test(normalized) ||
-    /(^|[/:._-])(moderation|ocr|image|dall-e|davinci|babbage|sora)([/:._-]|$)/u.test(normalized) ||
-    // Gemini-specific generation/live families (veo=video, lyria=music)
-    /(^|[/:._-])(veo|lyria|robotics|live)([/:._-]|$)/u.test(normalized)
-  );
-}
-
 interface MappedModel {
   model: Model<Api>;
   source: string; // "builtin:provider/id" | "gateway"
   /** Set when the advertised output ceiling was capped (see FULL_WINDOW cap). */
   maxTokensCapped?: { reported: number };
 }
+
 
 function mapGatewayModel(
   gateway: GatewayConfig,
@@ -485,7 +528,6 @@ function mapGatewayModel(
   api: GatewayApi,
   inferenceBaseUrl: string,
 ): MappedModel | null {
-  if (isNonChatModel(id)) return null;
   if (gateway.excludedModels?.includes(id)) return null;
 
   const builtin = lookupBuiltin(id);
@@ -604,10 +646,12 @@ function mapGatewayModel(
   // vendor's API endpoint, not the model — e.g. Cloudflare's
   // supportsReasoningEffort:false is wrong for a vLLM backend that does
   // accept reasoning_effort. pi core derives endpoint-appropriate defaults
-  // from provider/baseUrl; set explicit values via gateway compat or the
-  // per-model overrides below.
-  if (gateway.compat && Object.keys(gateway.compat).length > 0) {
-    model.compat = { ...(model.compat ?? {}), ...gateway.compat };
+  // from provider/baseUrl — but for a *gateway* those defaults are the wrong
+  // way round, so stamp the strict-safe pair and let explicit config win.
+  {
+    const compat: Record<string, unknown> = { ...GATEWAY_COMPAT_DEFAULTS };
+    if (gateway.compat) Object.assign(compat, gateway.compat);
+    model.compat = { ...(model.compat ?? {}), ...compat };
   }
 
   // Per-model overrides are the topmost layer (protocol routing, thinking
@@ -641,18 +685,84 @@ function mapGatewayModel(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+function headersForApi(api: GatewayApi, apiKey: string): Record<string, string> {
+  return api === "anthropic-messages"
+    ? { accept: "application/json", "anthropic-version": "2023-06-01", "x-api-key": apiKey }
+    : { accept: "application/json", authorization: `Bearer ${apiKey}` };
+}
+
+interface NegotiatedLane {
+  api: GatewayApi;
+  headers: Record<string, string>;
+  entries: RawEntry[];
+  inferenceBaseUrl: string;
+  apiSource: "explicit" | "negotiated";
+}
+
+/**
+ * Decide which inference protocol a lane speaks.
+ *
+ * The Anthropic-compatible surface differs from the OpenAI one in two ways
+ * that break a plain Bearer call: `/models` requires an `anthropic-version`
+ * header, and inference lives at `/v1/messages` rather than `/chat/completions`.
+ * A gateway fronting it is routinely registered without saying so, because
+ * `api` defaults to `openai-completions` and nothing in the URL guarantees the
+ * truth — so the lane is registered, discovery fails or yields an unusable
+ * model set, and the cause is invisible unless you know to look.
+ *
+ * Resolution order:
+ *   1. an explicit `gateway.api` always wins (single attempt, no behaviour
+ *      change for existing configs);
+ *   2. otherwise try the OpenAI header style first — that is today's default,
+ *      so the common case costs exactly one request — then fall back to the
+ *      Anthropic style.
+ *
+ * Limitation worth stating: `openai-completions` and `openai-responses` share
+ * an identical `/models` surface, so negotiation can only ever distinguish
+ * Anthropic-shaped lanes from OpenAI-shaped ones. Choosing between the two
+ * OpenAI protocols stays a config/quirk-table decision.
+ */
+async function negotiateLane(
+  gateway: GatewayConfig,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<NegotiatedLane> {
+  const candidates: GatewayApi[] = gateway.api
+    ? [gateway.api]
+    : ["openai-completions", "anthropic-messages"];
+  const apiSource: "explicit" | "negotiated" = gateway.api ? "explicit" : "negotiated";
+
+  let firstError: unknown;
+  for (const api of candidates) {
+    const headers = headersForApi(api, apiKey);
+    try {
+      const { entries, inferenceBaseUrl } = await fetchModelList(gateway.baseUrl, headers, signal);
+      return { api, headers, entries, inferenceBaseUrl, apiSource };
+    } catch (error) {
+      firstError ??= error;
+      // Connection-level failure: the host is down or the URL is wrong.
+      // Retrying with a different auth style just doubles the latency of
+      // every unreachable gateway, so stop and report the original error.
+      if (/unreachable|connection failed|ENOTFOUND|EAI_AGAIN|ETIMEDOUT/iu.test(errorMessage(error))) {
+        throw error;
+      }
+      if (signal?.aborted) throw error;
+    }
+  }
+
+  throw new Error(
+    `${errorMessage(firstError)}\n  (tried both OpenAI and Anthropic model-list auth styles; ` +
+      `set "api" explicitly on the gateway if neither is correct)`,
+  );
+}
+
 export async function discoverGateway(
   gateway: GatewayConfig,
   apiKey: string,
   signal?: AbortSignal,
 ): Promise<GatewayDiscoveryResult> {
-  const api: GatewayApi = gateway.api ?? "openai-completions";
-  const headers: Record<string, string> =
-    api === "anthropic-messages"
-      ? { accept: "application/json", "anthropic-version": "2023-06-01", "x-api-key": apiKey }
-      : { accept: "application/json", authorization: `Bearer ${apiKey}` };
-
-  const { entries, inferenceBaseUrl: rawInferenceBaseUrl } = await fetchModelList(gateway.baseUrl, headers, signal);
+  const lane = await negotiateLane(gateway, apiKey, signal);
+  const { api, headers, entries, inferenceBaseUrl: rawInferenceBaseUrl } = lane;
   // The Anthropic SDK appends /v1/messages to the base URL, so a discovered
   // base ending in /v1 would produce /v1/v1/messages — strip it for anthropic.
   const inferenceBaseUrl =
@@ -668,6 +778,9 @@ export async function discoverGateway(
   const matched: ModelMatch[] = [];
   const unmatched: GatewayDiscoveryStatus["unmatched"] = [];
   const maxTokensCapped: NonNullable<GatewayDiscoveryStatus["maxTokensCapped"]> = [];
+  const excludedUnusable: NonNullable<GatewayDiscoveryStatus["excludedUnusable"]> = [];
+  const quirksApplied: NonNullable<GatewayDiscoveryStatus["quirksApplied"]> = [];
+  const quirksSuppressed: NonNullable<GatewayDiscoveryStatus["quirksSuppressed"]> = [];
   const seen = new Set<string>();
 
   for (const entry of entries) {
@@ -677,9 +790,56 @@ export async function discoverGateway(
     if (seen.has(id)) continue;
     seen.add(id);
 
+    // Never-register families: report the reason rather than dropping silently,
+    // so "why is model X missing?" is answerable without re-reading the source.
+    const unusable =
+      gateway.excludeUnusable === false
+        ? undefined
+        : unusableModelReason(id) ?? retiredModelReason(entry);
+    if (unusable) {
+      excludedUnusable.push({ id, reason: unusable });
+      continue;
+    }
+
     const info = infoMap?.get(id);
     const mapped = mapGatewayModel(gateway, id, entry, info, api, inferenceBaseUrl);
     if (!mapped) continue;
+
+    // Protocol + thinking levels, in priority order:
+    //   modelOverrides > upstream-declared vocabulary > quirk table > defaults
+    const quirk = resolveQuirk(id);
+    const declared = declaredThinkingLevelMap(entry);
+    const explicit = gateway.modelOverrides?.[id];
+    const notes: string[] = [];
+    let source: "declared" | "quirk" | undefined;
+
+    if (quirk?.api) {
+      if (lane.apiSource === "explicit" && !explicit?.api) {
+        quirksSuppressed.push({
+          id,
+          note: `would route to ${quirk.api} (${quirk.notes.join("; ")}), but this lane pins`
+            + ` "api": "${lane.api}" in config — pin the model instead with`
+            + ` modelOverrides["${id}"].api`,
+        });
+      } else if (!explicit?.api) {
+        mapped.model.api = quirk.api;
+        notes.push(...quirk.notes);
+        source = "quirk";
+      }
+    }
+
+    const levelMap = declared ?? quirk?.thinkingLevelMap;
+    if (levelMap && !explicit?.thinkingLevelMap) {
+      mapped.model.thinkingLevelMap = { ...levelMap };
+      source = declared ? "declared" : "quirk";
+      notes.push(
+        declared
+          ? `vocabulary declared by upstream: ${JSON.stringify(levelMap)}`
+          : quirk?.notes.join("; ") ?? "",
+      );
+    }
+
+    if (source) quirksApplied.push({ id, note: notes.filter(Boolean).join("; "), source });
 
     models.push(mapped.model);
     if (mapped.maxTokensCapped) {
@@ -699,9 +859,14 @@ export async function discoverGateway(
       matched,
       unmatched,
       inferenceBaseUrl,
+      api,
+      apiSource: lane.apiSource,
       ...(healthCounts ? { healthyEndpoints: healthCounts.healthy, unhealthyEndpoints: healthCounts.unhealthy } : {}),
       litellmEnriched: (infoMap?.size ?? 0) > 0,
       ...(maxTokensCapped.length > 0 ? { maxTokensCapped } : {}),
+      ...(excludedUnusable.length > 0 ? { excludedUnusable } : {}),
+      ...(quirksApplied.length > 0 ? { quirksApplied } : {}),
+      ...(quirksSuppressed.length > 0 ? { quirksSuppressed } : {}),
     },
   };
 }

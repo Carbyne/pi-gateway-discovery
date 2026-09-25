@@ -50,6 +50,15 @@ export interface GatewayConfig {
   /** Model ids to never register. */
   excludedModels?: string[];
   /**
+   * Drop models that can never serve a chat/completions request — realtime,
+   * audio/transcription, completions-only base models, and families without
+   * function calling. Default: true, because such an entry is dead weight in
+   * the `/model` picker that only fails on first use. Set false to keep every
+   * id the gateway lists (e.g. a gateway that reuses one of those words for a
+   * genuine chat model).
+   */
+  excludeUnusable?: boolean;
+  /**
    * Route streaming inference requests through a node:http/https-backed
    * fetch instead of the global (undici) fetch. Set this for gateways that
    * only negotiate HTTP/1.1: undici can buffer the entire chunked response
@@ -79,6 +88,17 @@ export const CONFIG_PATH = join(AGENT_DIR, "gateway-discovery.json");
 export const AUTH_PATH = join(AGENT_DIR, "auth.json");
 export const MODELS_STORE_PATH = join(AGENT_DIR, "models-store.json");
 export const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
+/**
+ * Per-gateway discovery metadata that pi's model cache does not carry: which
+ * models were auto-configured and by which layer, which were suppressed, and
+ * which were filtered as unusable.
+ *
+ * Kept in its own file rather than inside `models-store.json` so pi keeps
+ * ownership of the model cache, and written next to each successful discovery.
+ * Without it, `describe` and `doctor` can only answer provenance in the one
+ * session that happened to run discovery — i.e. almost never.
+ */
+export const DISCOVERY_META_PATH = join(AGENT_DIR, "gateway-discovery-meta.json");
 
 export function isGatewayApi(value: unknown): value is GatewayApi {
   return value === "openai-completions" || value === "openai-responses" || value === "anthropic-messages";
@@ -208,6 +228,15 @@ export function suggestGatewayIdentity(
 // Persistence (atomic, 0600)
 // ---------------------------------------------------------------------------
 
+/**
+ * Validate + normalize a parsed config object. Exported so import paths can
+ * reuse exactly the rules the on-disk file is held to, rather than inventing a
+ * second, laxer parser that lets a bad bundle reach the registry.
+ */
+export function parseGatewayConfig(value: unknown): GatewayConfigFile {
+  return parseConfigFile(value);
+}
+
 function parseConfigFile(value: unknown): GatewayConfigFile {
   if (!value || typeof value !== "object") throw new Error("Configuration must be a JSON object");
   const input = value as { version?: unknown; gateways?: unknown; autoRefreshTtlHours?: unknown };
@@ -246,11 +275,65 @@ function parseConfigFile(value: unknown): GatewayConfigFile {
         : {}),
       ...(parseModelOverrides(item.modelOverrides) ? { modelOverrides: parseModelOverrides(item.modelOverrides) } : {}),
       ...(excludedModels && excludedModels.length > 0 ? { excludedModels } : {}),
+      // Preserve an explicit false: the effective default is true.
+      ...(item.excludeUnusable === false ? { excludeUnusable: false } : {}),
       ...(typeof item.directHttpStreaming === "boolean" && item.directHttpStreaming ? { directHttpStreaming: true } : {}),
     };
   });
 
   return { version: 1, ...(autoRefreshTtlHours !== undefined ? { autoRefreshTtlHours } : {}), gateways };
+}
+
+/** Discovery metadata keyed by gateway id; absence just means "not yet recorded". */
+export interface GatewayDiscoveryMeta {
+  syncedAt: number;
+  modelCount: number;
+  /** Inference base actually used, so `describe` is right in fresh sessions too. */
+  inferenceBaseUrl?: string;
+  excludedUnusable?: Array<{ id: string; reason: string }>;
+  quirksApplied?: Array<{ id: string; note: string; source: "declared" | "quirk" }>;
+  quirksSuppressed?: Array<{ id: string; note: string }>;
+}
+
+export async function loadDiscoveryMeta(): Promise<Record<string, GatewayDiscoveryMeta>> {
+  try {
+    const parsed = JSON.parse(await readFile(DISCOVERY_META_PATH, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, GatewayDiscoveryMeta>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Read-modify-write one gateway's metadata. A whole-file rewrite would let two
+ * concurrent syncs clobber each other's entries, so the file is re-read here
+ * and only the one key is replaced.
+ */
+export async function saveDiscoveryMeta(
+  gatewayId: string,
+  meta: GatewayDiscoveryMeta,
+): Promise<void> {
+  const all = await loadDiscoveryMeta();
+  all[gatewayId] = meta;
+  await mkdir(dirname(DISCOVERY_META_PATH), { recursive: true });
+  const tempPath = `${DISCOVERY_META_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(tempPath, `${JSON.stringify(all, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(tempPath, DISCOVERY_META_PATH);
+    await chmod(DISCOVERY_META_PATH, 0o600);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
+}
+
+export async function deleteDiscoveryMeta(gatewayId: string): Promise<void> {
+  const all = await loadDiscoveryMeta();
+  if (!(gatewayId in all)) return;
+  delete all[gatewayId];
+  await writeFile(DISCOVERY_META_PATH, `${JSON.stringify(all, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 export async function loadConfig(): Promise<GatewayConfigFile> {
@@ -260,6 +343,97 @@ export async function loadConfig(): Promise<GatewayConfigFile> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, gateways: [] };
     throw new Error(`Cannot load ${CONFIG_PATH}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Change detection
+// ---------------------------------------------------------------------------
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+/** Key-order-insensitive fingerprint, so a merely reordered file is not a change. */
+export function fingerprintConfig(config: GatewayConfigFile): string {
+  return stableStringify(config);
+}
+
+export interface ConfigDelta {
+  added: string[];
+  removed: string[];
+  modified: string[];
+  /** Whether the refresh TTL changed (affects scheduling, not providers). */
+  ttlChanged: boolean;
+  changed: boolean;
+}
+
+const NO_DELTA: ConfigDelta = { added: [], removed: [], modified: [], ttlChanged: false, changed: false };
+
+/**
+ * Compare two loaded configs by gateway id.
+ *
+ * Exists because `configFile` is captured at extension load and every provider
+ * closes over its own `GatewayConfig`. Editing the file on disk (or having
+ * another session edit it) therefore leaves `sync` re-deriving models from the
+ * *stale* object while still reporting `state: "ok"` with a model count —
+ * indistinguishable from success. Callers diff, re-register what moved, and
+ * surface the rest as drift.
+ */
+export function diffGatewayConfigs(before: GatewayConfigFile, after: GatewayConfigFile): ConfigDelta {
+  if (before === after) return NO_DELTA;
+  const beforeById = new Map(before.gateways.map((g) => [g.id, g]));
+  const afterById = new Map(after.gateways.map((g) => [g.id, g]));
+
+  const added: string[] = [];
+  const modified: string[] = [];
+  const removed: string[] = [];
+
+  for (const [id, gateway] of afterById) {
+    const previous = beforeById.get(id);
+    if (!previous) added.push(id);
+    else if (stableStringify(previous) !== stableStringify(gateway)) modified.push(id);
+  }
+  for (const id of beforeById.keys()) {
+    if (!afterById.has(id)) removed.push(id);
+  }
+
+  const ttlChanged = before.autoRefreshTtlHours !== after.autoRefreshTtlHours;
+  return {
+    added,
+    removed,
+    modified,
+    ttlChanged,
+    changed: added.length + removed.length + modified.length > 0 || ttlChanged,
+  };
+}
+
+/**
+ * Fold an imported set of gateways into the current config.
+ *
+ * `merge` upserts by gateway id and keeps everything the bundle does not
+ * mention; `replace` adopts the bundle verbatim. Pure, so the semantics that
+ * decide whether someone's tuned setup survives an import are testable without
+ * a running pi session.
+ */
+export function mergeGatewayConfigs(
+  current: GatewayConfigFile,
+  incoming: GatewayConfigFile,
+  mode: "merge" | "replace",
+): GatewayConfigFile {
+  if (mode === "replace") return incoming;
+  const byId = new Map(current.gateways.map((g) => [g.id, g]));
+  for (const gateway of incoming.gateways) byId.set(gateway.id, gateway);
+  return {
+    version: 1,
+    autoRefreshTtlHours: incoming.autoRefreshTtlHours ?? current.autoRefreshTtlHours,
+    gateways: [...byId.values()].sort((a, b) => a.id.localeCompare(b.id)),
+  };
 }
 
 export async function saveConfig(next: GatewayConfigFile): Promise<void> {
