@@ -330,6 +330,15 @@ function withDirectStreamingFetch(streams: ProviderStreams): ProviderStreams {
   return wrapped;
 }
 
+/** Display name for provider UIs (/login list, /model): always carries the
+ *  gateway id so multiple lanes of one host (all named "Yoda") stay
+ *  distinguishable. Raw gateway.name remains in diagnostics that print id
+ *  separately. */
+function providerDisplayName(gateway: GatewayConfig): string {
+  if (!gateway.name || gateway.name === gateway.id) return gateway.id;
+  return `${gateway.name} (${gateway.id})`;
+}
+
 function makeProvider(gateway: GatewayConfig): Provider<Api> {
   const api: GatewayApi = gateway.api ?? "openai-completions";
 
@@ -344,15 +353,15 @@ function makeProvider(gateway: GatewayConfig): Provider<Api> {
 
   return createProvider<Api>({
     id: gateway.id,
-    name: gateway.name,
+    name: providerDisplayName(gateway),
     baseUrl: inferenceBaseUrlForApi(gateway.baseUrl, api),
     auth: {
       apiKey: {
-        name: `${gateway.name} API key`,
+        name: `${providerDisplayName(gateway)} API key`,
         async login(interaction) {
           const key = await interaction.prompt({
             type: "secret",
-            message: `Enter the API key for ${gateway.name} (${gateway.baseUrl})`,
+            message: `Enter the API key for '${providerDisplayName(gateway)}' (${gateway.baseUrl})`,
           });
           if (!key.trim()) throw new Error("API key cannot be empty");
           return { type: "api_key", key: key.trim() };
