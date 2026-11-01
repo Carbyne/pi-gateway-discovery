@@ -1,0 +1,25 @@
+{"type":"session_rebound","value":{"reason":"startup"},"at":"2026-09-05T19:30:53.672Z"}
+{"type":"session_waiting_for_load","value":{"reason":"startup"},"at":"2026-09-05T19:30:53.680Z"}
+{"type":"state","value":{"goal":null,"list":[],"loop":null,"mainModelRecovery":null,"lastModelRef":"yoda-kyber/yoda/qwen3.8-flash","lastCompactionAt":null,"supervisorPausedAt":null,"loadHoldAt":null,"lastOutcome":null},"at":"2026-09-05T19:33:28.510Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":{"inputTokens":73583,"outputTokens":894,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":74477},"contextUsage":{"tokens":74477,"contextWindow":262144,"percent":28.410720825195312}},"at":"2026-09-05T19:38:14.239Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":{"inputTokens":74496,"outputTokens":2262,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":76758},"contextUsage":{"tokens":76758,"contextWindow":262144,"percent":29.280853271484375}},"at":"2026-09-05T19:43:20.687Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":null,"contextUsage":{"tokens":105233,"contextWindow":262144,"percent":40.14320373535156}},"at":"2026-09-05T19:58:33.133Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":{"inputTokens":113882,"outputTokens":914,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":114796},"contextUsage":{"tokens":114796,"contextWindow":262144,"percent":43.79119873046875}},"at":"2026-09-05T20:03:42.938Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":null,"contextUsage":{"tokens":115154,"contextWindow":262144,"percent":43.927764892578125}},"at":"2026-09-05T20:23:33.579Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":null,"contextUsage":{"tokens":122313,"contextWindow":262144,"percent":46.65870666503906}},"at":"2026-09-05T20:30:52.792Z"}
+{"type":"context_usage_sample","value":{"goalId":null,"provider":"yoda-kyber","model":"yoda/qwen3.8-flash","providerUsage":{"inputTokens":126573,"outputTokens":510,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":127083},"contextUsage":{"tokens":127083,"contextWindow":262144,"percent":48.47831726074219}},"at":"2026-09-05T20:34:36.010Z"}
+{"type":"session_shutdown","value":{"reason":"quit"},"at":"2026-09-05T20:37:42.759Z"}
+{"type":"session_rebound","value":{"reason":"startup"},"at":"2026-09-05T20:39:27.718Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:40:04.781Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:40:41.474Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:41:08.693Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:41:10.325Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:41:16.684Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:41:18.871Z"}
+{"type":"context_hygiene_dropped","value":{"dropped":1,"kept":1,"lastError":"Request timed out.","generation":2},"at":"2026-09-05T20:41:22.175Z"}
+{"type":"session_shutdown","value":{"reason":"quit"},"at":"2026-09-05T20:49:04.879Z"}
+{"type":"session_rebound","value":{"reason":"startup"},"at":"2026-09-05T20:49:12.712Z"}
+{"type":"session_shutdown","value":{"reason":"new"},"at":"2026-09-06T07:45:11.290Z"}
+{"type":"session_rebound","value":{"reason":"new"},"at":"2026-09-06T07:45:11.804Z"}
+{"type":"id_invalidation","value":{"oldId":"01a0730d-60ad-7d15-aa50-3e81da246654","newId":"01a075ad-ac76-748e-9863-6b82c3c6ade6","reason":"session_shutdown","shutdownReason":"new","at":"2026-09-06T07:45:11.811Z"},"at":"2026-09-06T07:45:11.812Z"}
+{"type":"session_shutdown","value":{"reason":"quit"},"at":"2026-09-06T07:45:16.305Z"}
